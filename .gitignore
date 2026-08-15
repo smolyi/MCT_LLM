@@ -1,0 +1,26 @@
+# Virtual environment
+mct-env/
+
+# Downloaded dataset + all pipeline-generated artifacts (tracks, predictions, graphs, debug dumps) --
+# regenerate via scripts/, not something to check into git (data/scene_061 alone is ~800MB of raw
+# dataset plus generated outputs on top of that)
+data/
+
+# Vendored TrackEval's bundled sample data (2.7GB) -- eval_ref/trackeval and eval_ref/utils (the
+# actual vendored code, ~450KB) are kept; only the large sample dataset is excluded
+eval_ref/sample_file/
+
+# Downloaded model weights -- auto-fetched by ultralytics/torchreid on first run, not original work
+*.pt
+checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local Claude Code tool-permission settings (personal, not project-shared)
+.claude/
+
+# Misc
+outputs/
+.DS_Store

@@ -1,0 +1,11 @@
+# Tuned for crowded camera views (camera_0537/0538): default track_buffer=30
+# was causing heavy ID fragmentation under occlusion (AssA 7-15% despite
+# DetA 77-80%). Raising track_buffer lets a track survive longer occlusion
+# gaps before being dropped and replaced with a new ID.
+tracker_type: bytetrack
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 90
+match_thresh: 0.8
+fuse_score: True
