@@ -151,7 +151,11 @@ class GraphTools:
         top_k defaults effectively unbounded (well above this scene's ~750-entity scale) -- a low
         default here was the exact same class of bug as rank_entities_by_interaction_count's earlier
         top_k=10 truncation: an entity with 40 real confirmed matches would silently show only 10,
-        with no signal to the caller that anything was cut off."""
+        with no signal to the caller that anything was cut off.
+        Per-interactor interaction counts (e.g. "for each of these, how many interactions do THEY
+        have") are deliberately NOT precomputed here -- this is a general tool, and the LLM is
+        expected to call it again per interactor itself when a query needs that next level of
+        detail, the same way it composes any other multi-step query."""
         target_by_cam = self._frame_pos_by_camera(global_id)
         if not any(target_by_cam.values()):
             return {"error": f"no entity with global_id={global_id}"}
@@ -231,6 +235,25 @@ class GraphTools:
             "confirmed_proximity_matches": [r for r in results if r["match_type"] == "confirmed_proximity"][:top_k],
             "uncertain_proximity_matches": [r for r in results if r["match_type"] == "uncertain_proximity"][:top_k],
             "likely_same_person_matches": [r for r in results if r["match_type"] == "likely_same_person"][:top_k],
+        }
+
+    def count_nearby_entities(self, global_id: int, max_distance_m: float = 2.0, max_gap_sec: float = 1.0) -> dict:
+        """Just the confirmed-interaction COUNT for one entity, not the full match detail -- a
+        general 'how many' primitive, useful any time a query needs a number rather than a list.
+        Reuses find_nearby_entities' own computation so the count is always consistent with what that
+        tool would report; exists as a separate tool because asking for full detail on every one of an
+        entity's own interactors (e.g. 'for each interactor, how many interactions do THEY have') was
+        observed, via debug trace, to make the model fetch entire proximity-match dumps for every
+        interactor instead of just their counts -- correct but unreadably verbose. A lightweight
+        count-only call keeps that kind of compound query's answer readable."""
+        result = self.find_nearby_entities(global_id, max_distance_m, max_gap_sec)
+        if "error" in result:
+            return result
+        return {
+            "global_id": global_id,
+            "appearance_caption": result.get("target_caption"),
+            "caption_agreement": self.entities.get(global_id, {}).get("caption_agreement"),
+            "confirmed_interaction_count": len(result["confirmed_proximity_matches"]),
         }
 
     def find_nearby_entities_by_description(self, description: str, min_similarity: float = 0.7,

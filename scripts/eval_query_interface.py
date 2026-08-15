@@ -167,6 +167,7 @@ def main():
         "find_entities_in_camera": tools.find_entities_in_camera,
         "check_entities_cooccur": tools.check_entities_cooccur,
         "find_nearby_entities": tools.find_nearby_entities,
+        "count_nearby_entities": tools.count_nearby_entities,
         "find_nearby_entities_by_description": tools.find_nearby_entities_by_description,
         "list_multi_camera_entities": tools.list_multi_camera_entities,
         "rank_entities_by_interaction_count": tools.rank_entities_by_interaction_count,
