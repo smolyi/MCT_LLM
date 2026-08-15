@@ -170,6 +170,7 @@ def main():
         "count_nearby_entities": tools.count_nearby_entities,
         "find_nearby_entities_by_description": tools.find_nearby_entities_by_description,
         "list_multi_camera_entities": tools.list_multi_camera_entities,
+        "list_low_quality_caption_entities": tools.list_low_quality_caption_entities,
         "rank_entities_by_interaction_count": tools.rank_entities_by_interaction_count,
     }
 

@@ -48,7 +48,49 @@ from PIL import Image
 from sentence_transformers import SentenceTransformer
 from transformers import BlipForConditionalGeneration, BlipProcessor
 
+from graph_tools import GraphTools
+
 CROPS_PER_ENTITY = 3
+
+FRAME_MARGIN_PX = 5  # a bbox this close to the frame edge is likely a cut-off figure -- captioning a
+# partial view (only half a person visible, say) is far more likely to produce a wrong/nonsense
+# caption than a fully-visible crop would, so these are excluded from crop sampling entirely.
+
+MIN_SIGHTING_DETECTIONS_FOR_CAPTION = 10  # skip sampling crops from a sighting fragment this short --
+# same threshold GraphTools.MIN_RELIABLE_DETECTIONS uses for proximity matching, same reasoning: a
+# handful of detections is more likely a track fragment/artifact than a real, stable sighting worth
+# captioning at all.
+
+BLIP_CONFIDENCE_THRESHOLD = 0.3  # mean per-token max-softmax probability across the generated caption
+# -- flags captions BLIP itself generated with low confidence, a different signal from cross-crop
+# caption_agreement (one caption's OWN generation could be uncertain even if several equally-uncertain
+# crops happen to land on similar wording). An initial guess of 0.5 was checked against the actual
+# distribution across all 2063 sampled captions on this dataset (mean 0.412, median 0.409, p10 0.316,
+# max 0.879) and found to exclude 88% of ALL captions, not just outliers -- effectively disabling the
+# multi-crop consensus mechanism for nearly every entity. 0.3 (~p10) only excludes genuinely low
+# outliers instead.
+
+
+def is_degenerate_caption(caption: str) -> bool:
+    """Flags BLIP decoder degeneration -- greedy decoding occasionally gets stuck looping the same
+    word (e.g. "a bald bald bald bald..."), a real observed failure -- found via manual inspection of
+    an entity whose consensus caption was exactly this, which the medoid step had picked over two
+    coherent, real person descriptions in its own all_captions ("a woman walking down the street with
+    her dog", "a man in a white shirt and tie") simply because its embedding happened to land near
+    their mean. Same root-cause class as this project's LLM tool-call generation degenerating under
+    greedy decoding (see query_interface.py) -- repetitive output collapsing decoding reliability,
+    just in a captioning model instead of an LLM. A caption is degenerate if any single word repeats
+    3+ times in a row."""
+    words = caption.lower().split()
+    run = 1
+    for i in range(1, len(words)):
+        if words[i] == words[i - 1]:
+            run += 1
+            if run >= 3:
+                return True
+        else:
+            run = 1
+    return False
 
 
 def pick_sample_frames(frames: list, k: int) -> list:
@@ -92,11 +134,16 @@ def main():
             cam, gid, frame, l, t, w, h, wx, wy = line.split()
             by_cam_frame[(cam, int(frame))].append((int(gid), float(l), float(t), float(w), float(h)))
 
-    # For each entity, pick sample (camera, frame) points spread across ALL its sightings.
+    # For each entity, pick sample (camera, frame) points spread across ALL its sightings -- but only
+    # from sightings with enough detections to be a real, stable sighting rather than a track fragment
+    # (see MIN_SIGHTING_DETECTIONS_FOR_CAPTION). If an entity has no sighting that qualifies, fall back
+    # to using all of them anyway -- some sample is still better than captioning nothing.
     sample_targets_by_camera = defaultdict(list)  # camera -> [(gid, frame), ...]
     for gid, sightings in sightings_by_entity.items():
+        reliable = [(n, d) for n, d in sightings if d.get("num_detections", 0) >= MIN_SIGHTING_DETECTIONS_FOR_CAPTION]
+        source_sightings = reliable or sightings
         all_frames = []  # (frame, camera) -- sort key first so spacing is chronological-ish
-        for n, d in sightings:
+        for n, d in source_sightings:
             for frame, t, wx, wy in d.get("trajectory", []):
                 all_frames.append((frame, d["camera"]))
         all_frames.sort(key=lambda x: x[0])
@@ -108,18 +155,36 @@ def main():
     for cam, targets in sample_targets_by_camera.items():
         cam_dir = f"camera_{int(cam):04d}"
         cap = cv2.VideoCapture(str(scene_dir / cam_dir / "video.mp4"))
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         for gid, frame in targets:
+            # Two passes: prefer a non-margin bbox within the search window, but fall back to a
+            # margin-touching one rather than yielding nothing at all -- a first version of this made
+            # margin-avoidance a hard requirement within the ±16-frame window, which left 352 of 749
+            # entities (mostly ones that only ever appear near a frame edge, e.g. walking along the
+            # periphery) with ZERO extractable crops and therefore no appearance_caption at all, a much
+            # worse outcome than occasionally captioning a partially cut-off figure.
             bbox = None
+            fallback_bbox = None
             for offset in range(0, 16):
                 for fr in (frame + offset, frame - offset):
                     for cand_gid, l, t, w, h in by_cam_frame.get((cam, fr), []):
-                        if cand_gid == gid:
-                            bbox = (fr, l, t, w, h)
-                            break
+                        if cand_gid != gid:
+                            continue
+                        touches_margin = (l <= FRAME_MARGIN_PX or t <= FRAME_MARGIN_PX
+                                           or (l + w) >= frame_w - FRAME_MARGIN_PX
+                                           or (t + h) >= frame_h - FRAME_MARGIN_PX)
+                        if touches_margin:
+                            if fallback_bbox is None:
+                                fallback_bbox = (fr, l, t, w, h)
+                            continue  # keep searching nearby frames for a clean, non-margin option
+                        bbox = (fr, l, t, w, h)
+                        break
                     if bbox:
                         break
                 if bbox:
                     break
+            bbox = bbox or fallback_bbox
             if bbox is None:
                 continue
             fr, l, t, w, h = bbox
@@ -142,30 +207,65 @@ def main():
     blip.eval()
     embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
+    human_words = GraphTools.HUMAN_CAPTION_WORDS
+
     n_captioned = 0
     n_low_agreement = 0
     for gid, crops in crops_by_gid.items():
         captions = []
+        blip_confidences = []
         for crop in crops:
             image = Image.fromarray(crop)
             inputs = processor(image, return_tensors="pt").to("cuda")
             with torch.no_grad():
-                out = blip.generate(**inputs, max_new_tokens=30)
-            captions.append(processor.decode(out[0], skip_special_tokens=True))
+                out = blip.generate(**inputs, max_new_tokens=30, return_dict_in_generate=True, output_scores=True)
+            captions.append(processor.decode(out.sequences[0], skip_special_tokens=True))
+            # Mean per-token max-softmax probability across the generated sequence -- BLIP's OWN
+            # confidence in its output, a different signal from cross-crop caption_agreement (a
+            # caption can be the only one sampled, or several crops can coincidentally agree, while
+            # BLIP itself was uncertain at every generation step).
+            token_probs = [torch.softmax(step_logits[0], dim=-1).max().item() for step_logits in out.scores]
+            blip_confidences.append(sum(token_probs) / len(token_probs) if token_probs else 0.0)
 
-        if len(captions) == 1:
-            consensus, agreement = captions[0], 1.0
+        # A caption is excluded from medoid selection (never eligible as the consensus) if it's
+        # degenerate (decoder looping) OR BLIP itself generated it with low confidence -- still
+        # recorded in all_captions/all_caption_confidences either way, just not trusted as consensus.
+        valid_idxs = [i for i, c in enumerate(captions)
+                      if not is_degenerate_caption(c) and blip_confidences[i] >= BLIP_CONFIDENCE_THRESHOLD]
+        if not valid_idxs:
+            valid_idxs = [0]  # every sample failed both checks -- no usable signal, but still need
+            # something to store as appearance_caption
+        valid = [captions[i] for i in valid_idxs]
+        some_excluded = len(valid) < len(captions)
+
+        # Majority-vote tiebreak: found via manual inspection of a real case (global_id 8, "a sandwich
+        # with a sandwich on it") where pure embedding-distance-to-mean picked a caption with no human
+        # words as consensus even though 2 of 3 valid captions clearly described a person ("a man is
+        # standing on a ledge", "a woman is running on a black surface") -- a small-sample (n=3) medoid
+        # can get pulled off by one confident-but-wrong outlier. If a strict majority of the valid
+        # captions mention a person, restrict medoid candidates to just those before picking.
+        def _mentions_human(c):
+            return bool(set(c.lower().replace(",", " ").replace(".", " ").split()) & human_words)
+        human_subset = [c for c in valid if _mentions_human(c)]
+        if len(human_subset) > len(valid) - len(human_subset):
+            valid = human_subset
+
+        if len(valid) == 1:
+            # Either only one crop was sampled (nothing to disagree with, full confidence) or every
+            # OTHER sample was excluded (real uncertainty, even though one caption survives to compare).
+            consensus, agreement = valid[0], (0.0 if some_excluded else 1.0)
         else:
-            embs = embedder.encode(captions, normalize_embeddings=True)
+            embs = embedder.encode(valid, normalize_embeddings=True)
             mean_emb = embs.mean(axis=0)
             mean_emb /= np.linalg.norm(mean_emb)
-            consensus = captions[int(np.argmax(embs @ mean_emb))]
-            n = len(captions)
+            consensus = valid[int(np.argmax(embs @ mean_emb))]
+            n = len(valid)
             pairwise_sum = (embs @ embs.T).sum() - n  # exclude self-similarity (diagonal = 1)
             agreement = float(pairwise_sum / (n * (n - 1)))
 
         G.nodes[f"entity:{gid}"]["appearance_caption"] = consensus
         G.nodes[f"entity:{gid}"]["all_captions"] = captions
+        G.nodes[f"entity:{gid}"]["all_caption_confidences"] = [round(c, 3) for c in blip_confidences]
         G.nodes[f"entity:{gid}"]["caption_agreement"] = round(agreement, 3)
         n_captioned += 1
         if agreement < 0.6:

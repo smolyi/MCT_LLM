@@ -307,6 +307,59 @@ class GraphTools:
             for gid, cams in by_entity_cams.items() if len(cams) > 1
         ]
 
+    # Words that indicate a caption is describing an actual person -- absence of all of these is the
+    # heuristic list_low_quality_caption_entities uses to flag a caption as failed/unreliable (see that
+    # method's docstring for why this does NOT mean "genuinely non-human").
+    HUMAN_CAPTION_WORDS = {
+        "man", "men", "woman", "women", "person", "people", "boy", "boys", "girl", "girls",
+        "child", "children", "kid", "kids", "guy", "gentleman", "lady", "individual", "player", "players",
+    }
+
+    def list_low_quality_caption_entities(self) -> list:
+        """Full-graph scan (same pattern as list_multi_camera_entities) flagging entities whose
+        appearance_caption contains no human-referring word -- i.e. a caption that failed to describe
+        them as a person. Originally built as "list non-human entities" on the assumption that a
+        caption lacking human words meant a genuine non-human false positive from the person detector.
+        Direct manual inspection disproved that for the cases actually checked: one flagged entity's
+        video frame showed a real person (captioned "a sandwich with a sandwich on it"), and another's
+        OTHER sampled captions were "a woman walking down the street with her dog" and "a man in a
+        white shirt and tie" -- both clearly a person, with only a degenerate BLIP artifact ("a bald
+        bald bald...") lacking human words. The detector fires on the person class, so a false positive
+        is far more likely to be a real person captured badly (blur, occlusion, odd angle/crop) than an
+        actual non-human object appearing in this scene. So: this is a caption-QUALITY signal (this
+        caption failed badly enough to not even name what kind of subject it's looking at), not a
+        non-human classifier. Some flagged entities may still be genuine non-human detector false
+        positives -- the heuristic can't distinguish the two cases, which is exactly why it shouldn't
+        claim to.
+        Reports EVERY sighting (camera + time), not just the first -- an entity seen in several
+        cameras had its later appearances silently dropped in an earlier version of this tool; if
+        something was flagged, the reader should be able to see everywhere it was seen, not just where
+        it was first seen.
+        Entities whose ENTIRE track is short (fewer than MIN_RELIABLE_DETECTIONS detections, summed
+        across all sightings) are excluded entirely -- a near-instantaneous, blurry detection is more
+        likely pure tracking noise than a meaningful flagged entity, and a caption based on it (however
+        it reads) isn't worth reporting either way."""
+        results = []
+        for gid, data in self.entities.items():
+            caption = (data.get("appearance_caption") or "").lower()
+            words = set(caption.replace(",", " ").replace(".", " ").split())
+            if not words & self.HUMAN_CAPTION_WORDS:
+                sightings = sorted(self._sightings_of(gid), key=lambda d: d["start_frame"])
+                total_detections = sum(s.get("num_detections", 0) for s in sightings)
+                if total_detections < MIN_RELIABLE_DETECTIONS:
+                    continue
+                results.append({
+                    "global_id": gid,
+                    "appearance_caption": data.get("appearance_caption"),
+                    "caption_agreement": data.get("caption_agreement"),
+                    "sightings": [
+                        {"camera": s["camera"], "time": format_mmss(s["start_time_sec"])}
+                        for s in sightings
+                    ],
+                    "num_cameras": len({s["camera"] for s in sightings}),
+                })
+        return results
+
     def rank_entities_by_interaction_count(self, max_distance_m: float = 2.0, max_gap_sec: float = 1.0,
                                             top_k: int = 10) -> list:
         """Rank ALL entities by how many CONFIRMED proximity matches they have (genuine encounters with

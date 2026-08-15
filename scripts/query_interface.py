@@ -210,6 +210,26 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "list_low_quality_caption_entities",
+            "description": "List entities whose appearance_caption contains no human-referring word -- i.e. the "
+                            "caption FAILED to describe them as a person, for whatever reason. IMPORTANT: this is "
+                            "NOT a non-human object detector, despite what it might sound like -- direct manual "
+                            "verification found that entities flagged this way are usually still real people "
+                            "whose caption failed badly (blur, occlusion, a degenerate/repeated-word BLIP output), "
+                            "not genuine non-human detections. Use this for questions about caption quality/"
+                            "reliability, or 'which entities have failed/unusable captions' -- do NOT present "
+                            "results as 'these are non-human objects' or 'these aren't people'; present them as "
+                            "'these entities have a caption that failed to identify them as a person (most are "
+                            "probably still people)'. Already includes EVERY sighting (camera + time), not just "
+                            "the first -- do NOT call get_entity_timeline per entity for that. Entities with a "
+                            "very short total track are excluded already (too little evidence to be worth "
+                            "reporting either way).",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "rank_entities_by_interaction_count",
             "description": "For 'who has the most interactions' / 'busiest people' / 'top N by encounters' style "
                             "questions. Computes, for EVERY entity in the graph, how many confirmed (not "
@@ -286,13 +306,16 @@ only, not whether the matched entity's own caption (e.g. an activity claim) is a
 kinds of confidence separate in what you say.
 - If confirmed_proximity_matches is empty, say so plainly ("no confirmed proximity matches found") rather \
 than guessing or inventing an encounter.
-- find_nearby_entities, find_nearby_entities_by_description, and rank_entities_by_interaction_count all \
-return pre-formatted, already-correct text (not raw JSON) as their tool result -- every fact in that text \
-is guaranteed accurate and is automatically appended to your final answer verbatim, in the order you \
-called them, no matter how many of these calls you make. Because of this, you do NOT need to (and \
-should NOT) retype, paraphrase, or summarize the facts from these reports in your own final answer -- \
-write only a short framing/narration sentence or two; the detailed data will appear right after it \
-automatically. This also means you should feel free to call these tools MULTIPLE times in sequence for \
+- Several tools (find_nearby_entities, find_nearby_entities_by_description, rank_entities_by_interaction_count, \
+count_nearby_entities, list_low_quality_caption_entities, and any other tool whose result already reads like a \
+formatted report rather than raw JSON) return pre-formatted, already-correct text as their tool result -- \
+every fact in that text is guaranteed accurate and is automatically appended to your final answer verbatim, \
+in the order you called them, no matter how many of these calls you make or how long the list is. Because \
+of this, you do NOT need to (and should NOT) retype, paraphrase, re-list, or summarize the individual \
+entries from these reports in your own final answer -- write only a short framing/narration sentence or \
+two; the detailed data will appear right after it automatically. Retyping a long list yourself risks \
+getting cut off mid-list by your own output length limit -- the appended report never does. This also \
+means you should feel free to call these tools MULTIPLE times in sequence for \
 compound queries -- e.g. "rank the top 3 by interactions, then detail each one's interactions" needs one \
 ranking call FOLLOWED BY one detail call per entity in that ranking, not just the first call. Keep going \
 until you've covered every part of what the query actually asked before stopping.
@@ -354,8 +377,68 @@ DETERMINISTIC_REPORT_FORMATTERS = {
     "find_nearby_entities_by_description": lambda result: format_proximity_report(result),
     "rank_entities_by_interaction_count": lambda result: format_ranking_report(result),
     "count_nearby_entities": lambda result: format_count_report(result),
+    "list_low_quality_caption_entities": lambda result: format_low_quality_caption_report(result),
 }
 DETERMINISTIC_REPORT_TOOLS = set(DETERMINISTIC_REPORT_FORMATTERS)
+
+
+def format_low_quality_caption_report(result: list) -> str:
+    """Deterministically render a list_low_quality_caption_entities result -- routed through here for
+    the same reason as every list-returning tool in this file: list_multi_camera_entities (which does
+    NOT go through a deterministic formatter) had a real, documented miscount when left to the model's
+    own free text (281 actual vs 200 reported) -- this avoids repeating that specific bug on a new tool.
+    Originally built (and named) as a non-human OBJECT detector -- direct manual verification of two
+    flagged entities found both were real PEOPLE with a failed caption (one literally a video frame
+    showing a person, captioned "a sandwich"; another whose OTHER sampled captions clearly described a
+    person), not genuine non-human detections. Renamed and reworded throughout to reflect what this
+    heuristic actually measures: caption failure, not object classification."""
+    if not result:
+        return "No entities with a failed (non-human-word) caption found."
+
+    def fmt_entry(r):
+        # Always show the numeric agreement score explicitly -- a high score rendering as no suffix
+        # at all (agreement_flag's normal behavior) was easy to misread as "no score exists" rather
+        # than "the score is fine".
+        agreement = r.get("caption_agreement")
+        agreement_str = f"agreement={agreement}" if agreement is not None else "agreement unknown"
+        sightings = r.get("sightings", [])
+        sighting_str = "; ".join(f"camera {s['camera']} at {s['time']}" for s in sightings)
+        cams = f"{r.get('num_cameras', len({s['camera'] for s in sightings}))} camera(s) total"
+        return (f"  - global_id {r['global_id']}: {r['appearance_caption']} [{agreement_str}], "
+                f"seen: {sighting_str} ({cams})")
+
+    def is_low(r):
+        a = r.get("caption_agreement")
+        return a is None or a < CAPTION_AGREEMENT_THRESHOLD
+
+    low = [r for r in result if is_low(r)]
+    higher = [r for r in result if not is_low(r)]
+
+    lines = [f"{len(result)} entities whose caption contains no human-referring word -- i.e. the caption "
+             f"FAILED to identify them as a person. Based on direct verification (see this function's "
+             f"docstring), MOST of these are believed to be real people whose caption badly failed "
+             f"(blur, occlusion, a degenerate BLIP artifact), not genuine non-human objects -- do not "
+             f"present this as a list of non-human objects or claim these definitely aren't people.",
+             f"\nLow-confidence ({len(low)} of {len(result)}, caption_agreement below "
+             f"{CAPTION_AGREEMENT_THRESHOLD} or unknown -- least trustworthy, most likely a badly-failed "
+             f"caption of a real person):"]
+    lines += [fmt_entry(r) for r in low] if low else ["  (none)"]
+    lines.append(f"\nHigher-confidence ({len(higher)} of {len(result)}, caption_agreement at or above "
+                 f"{CAPTION_AGREEMENT_THRESHOLD} -- crops agreed with each other, but still flagged "
+                 f"because the caption itself names no person; could be a genuine non-human detection "
+                 f"or just a caption that failed the same way consistently):")
+    lines += [fmt_entry(r) for r in higher] if higher else ["  (none)"]
+
+    if len(result) > 10:
+        # Tested empirically: a system-prompt-only "don't retype long lists" rule did NOT stop the
+        # model from retyping this list itself and getting cut off mid-list by its own output length
+        # limit (observed via debug trace on this exact tool, at exactly this list size). Repeating the
+        # instruction here, right next to the data it applies to and closest to the model's next
+        # generation, is the pattern that has reliably worked all session (see format_ranking_report).
+        lines.append(f"\nDo NOT retype, re-list, or summarize these {len(result)} entries in your final "
+                      f"answer -- this exact list is appended automatically. Write only a short framing "
+                      f"sentence (e.g. how many were found and the general pattern), nothing more.")
+    return "\n".join(lines)
 
 
 def format_count_report(result: dict) -> str:
@@ -603,6 +686,10 @@ def answer_query(tokenizer, model, tool_fns, query: str, max_iters: int, verbose
     proximity_calls = {}  # (name, gid-or-description) -> (header, result)
     rank_report_texts = []  # formatted rank_entities_by_interaction_count reports, in call order
     count_results = {}  # global_id -> count_nearby_entities result
+    other_report_texts = []  # any OTHER deterministic-report tool's output, in call order -- a real
+    # bug lived here: build_display_reports originally only reconstructed the rank/proximity
+    # categories, so any tool outside those two (e.g. list_low_quality_caption_entities) silently never made it
+    # into the final answer at all, forcing the model to retype the whole thing itself from memory.
 
     known_entity_ids = set()  # every global_id CONFIRMED to exist via a real tool result so far --
     # used to recover from a real observed failure: the model sometimes bundles a ranking/search call
@@ -613,7 +700,7 @@ def answer_query(tokenizer, model, tool_fns, query: str, max_iters: int, verbose
 
     def build_display_reports() -> list:
         summary = format_deterministic_summary(proximity_calls)
-        reports = ([summary] if summary else []) + rank_report_texts + [
+        reports = ([summary] if summary else []) + rank_report_texts + other_report_texts + [
             f"{header}\n{format_proximity_report_merged(result, count_results)}"
             for header, result in proximity_calls.values()
         ]
@@ -768,6 +855,11 @@ def answer_query(tokenizer, model, tool_fns, query: str, max_iters: int, verbose
                     seen_interactor_ids.add(result["global_id"])
                     if result["global_id"] in pending_count_ids:
                         pending_count_ids.remove(result["global_id"])
+                else:
+                    # Any deterministic-report tool not covered by the specific categories above (e.g.
+                    # list_low_quality_caption_entities) -- without this, its report silently never reached the
+                    # final answer at all (see other_report_texts' declaration for the real bug this fixes).
+                    other_report_texts.append(f"{header}\n{report}")
                 deterministic_reports.append(f"{header}\n{report}")
                 if verbose:
                     print(f"\n--- deterministic report (fact-guaranteed, not LLM-generated) ---\n{report}\n")
@@ -858,6 +950,7 @@ def main():
         "count_nearby_entities": tools.count_nearby_entities,
         "find_nearby_entities_by_description": tools.find_nearby_entities_by_description,
         "list_multi_camera_entities": tools.list_multi_camera_entities,
+        "list_low_quality_caption_entities": tools.list_low_quality_caption_entities,
         "rank_entities_by_interaction_count": tools.rank_entities_by_interaction_count,
     }
 
