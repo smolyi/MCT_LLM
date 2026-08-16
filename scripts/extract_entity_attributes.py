@@ -1,8 +1,7 @@
 """
 Attribute extraction: for each entity in the event graph, sample several
-crops spread across ALL its sightings (not just one), caption each with
-BLIP, and store both a consensus caption and an agreement score as node
-attributes.
+crops spread across ALL its sightings (not just one), caption each, and
+store both a consensus caption and an agreement score as node attributes.
 
 Single-crop captioning (see git history) was a documented source of real
 errors this project found directly by inspecting actual video frames: e.g.
@@ -21,16 +20,36 @@ the same entity produce very different captions, that's useful information
 Consensus caption = the sampled caption whose sentence-embedding is closest
 to the mean of all sampled captions' embeddings (the "medoid") -- more
 robust than an arbitrary single crop, and avoids trying to average
-embeddings and decode the result, which BLIP can't do (not invertible).
-caption_agreement = mean pairwise cosine similarity across the sampled
-captions' embeddings, in [0, 1] -- low agreement flags a caption as
+embeddings and decode the result, which the captioner can't do (not
+invertible). caption_agreement = mean pairwise cosine similarity across the
+sampled captions' embeddings, in [0, 1] -- low agreement flags a caption as
 contested even though the query interface can't independently verify it.
 
-Uses Salesforce/blip-image-captioning-base rather than ../LMM_dive's
-TinyLMM: that project's own POPE evaluation found TinyLMM answers "yes"
-to essentially every yes/no question regardless of ground truth (0%
-"no"-accuracy) -- not reliable enough for descriptions we intend to
-actually query against. BLIP is a real, evaluated captioning model.
+Model: Qwen2.5-VL-3B-Instruct, chosen via a real Phase 0 bake-off against
+LLaVA-OneVision, BLIP-2/InstructBLIP, and (blocked by a tensorflow
+dependency in its trust_remote_code file) Molmo -- see CLAUDE.md's
+"Additional data sources" / captions-matching-actions section for the
+full writeup. Superseded the original Salesforce/blip-image-captioning-base
+(../LMM_dive's TinyLMM was ruled out earlier for its own reasons -- 0%
+"no"-accuracy on POPE) specifically because BLIP-base has NO instruction
+channel at all (its `text=` argument is a caption PREFIX to continue
+writing from, not a directive it can obey) -- that structural gap, not
+just "BLIP is weak," was the actual mechanism behind the tennis/sandwich
+hallucinations: there was no way to tell it "describe appearance only."
+
+Two deterministic (not prompt-reliant) fixes layered on top of the
+constrained instruction prompt, both added after the bake-off showed
+prompting alone isn't reliable enough on its own:
+- crop_quality.py's blur/size gate skips the VLM call entirely for crops
+  too degenerate to read (the bake-off's one real failure case was an 8px-
+  wide sliver, almost certainly a false-positive detection, that 2 of 3
+  candidates confidently captioned anyway despite an explicit "say if
+  unclear" hedge).
+- color_utils.py's RGB/Lab dominant-color sampling replaces the VLM's own
+  color guessing entirely (also unreliable even under an explicit "do not
+  mention color" instruction, confirmed in the same bake-off) -- garment
+  color in the final appearance_caption always comes from actual pixels,
+  never the captioning model.
 
 Usage:
   python scripts/extract_entity_attributes.py --scene_dir data/scene_061 --graph data/scene_061/event_graph.gpickle \
@@ -46,9 +65,23 @@ import numpy as np
 import torch
 from PIL import Image
 from sentence_transformers import SentenceTransformer
-from transformers import BlipForConditionalGeneration, BlipProcessor
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
 
+from color_utils import garment_region, dominant_color_name, strip_color_words
+from crop_quality import is_low_quality_crop, UNCLEAR_CAPTION
 from graph_tools import GraphTools
+from video_source import resolve_video_source
+
+CAPTION_MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
+
+CONSTRAINED_PROMPT = (
+    "Describe ONLY the visible clothing type and accessories of the person in this image "
+    "(e.g. jacket, t-shirt, backpack, hat). Do NOT mention color. Do NOT describe any action, "
+    "activity, pose, or what the person might be doing. If something is unclear or not visible, "
+    "say so briefly instead of guessing."
+)  # validated in the Phase 0 bake-off: eliminated activity/scene hallucination in 18/18 real crops
+# across all 3 candidates tested. Color suppression is NOT reliable even with this instruction (also
+# confirmed in the bake-off) -- handled by strip_color_words()+color_utils instead of trusted here.
 
 CROPS_PER_ENTITY = 3
 
@@ -61,14 +94,18 @@ MIN_SIGHTING_DETECTIONS_FOR_CAPTION = 10  # skip sampling crops from a sighting 
 # handful of detections is more likely a track fragment/artifact than a real, stable sighting worth
 # captioning at all.
 
-BLIP_CONFIDENCE_THRESHOLD = 0.3  # mean per-token max-softmax probability across the generated caption
-# -- flags captions BLIP itself generated with low confidence, a different signal from cross-crop
-# caption_agreement (one caption's OWN generation could be uncertain even if several equally-uncertain
-# crops happen to land on similar wording). An initial guess of 0.5 was checked against the actual
-# distribution across all 2063 sampled captions on this dataset (mean 0.412, median 0.409, p10 0.316,
-# max 0.879) and found to exclude 88% of ALL captions, not just outliers -- effectively disabling the
-# multi-crop consensus mechanism for nearly every entity. 0.3 (~p10) only excludes genuinely low
-# outliers instead.
+CAPTION_CONFIDENCE_THRESHOLD = 0.3  # mean per-token max-softmax probability across the generated
+# caption. Carried over from BLIP's original 0.3 (~p10 of BLIP's own 0.316-0.879 confidence spread)
+# as a starting guess, then CHECKED (not assumed) against Qwen2.5-VL-3B's real distribution on 193
+# real POM captions: min=0.921, p10=0.975, mean=0.992 -- the signal doesn't transfer, not just the
+# threshold. Qwen2.5-VL-3B's greedy decoding on this short, templated, low-entropy task ("The person
+# is wearing a [garment]...") is almost always sharply peaked, unlike BLIP's more variable open-ended
+# captioning -- there is no meaningful low-confidence tail to gate on here. Picking an arbitrary cutoff
+# inside the observed 0.92-1.0 band would exclude "least confident of many good outputs" rather than
+# genuine failures, so 0.3 is left in place deliberately AS AN EFFECTIVELY-INERT SAFETY NET (never
+# expected to fire in practice for this model) rather than replaced with a fake-precise number. The
+# degenerate-caption check and cross-crop caption_agreement remain the two signals that actually do
+# work for this model.
 
 
 def is_degenerate_caption(caption: str) -> bool:
@@ -112,6 +149,8 @@ def main():
     parser.add_argument("--graph", type=str, required=True)
     parser.add_argument("--out", type=str, required=True)
     parser.add_argument("--crops_per_entity", type=int, default=CROPS_PER_ENTITY)
+    parser.add_argument("--max_entities", type=int, default=None,
+                         help="Cap the number of entities processed, for a fast smoke test before a full run.")
     args = parser.parse_args()
 
     scene_dir = Path(args.scene_dir)
@@ -123,6 +162,10 @@ def main():
     for n, d in G.nodes(data=True):
         if d["type"] == "sighting":
             sightings_by_entity[d["global_id"]].append((n, d))
+
+    if args.max_entities is not None:
+        keep_gids = set(list(sightings_by_entity.keys())[:args.max_entities])
+        sightings_by_entity = {gid: v for gid, v in sightings_by_entity.items() if gid in keep_gids}
 
     print(f"Sampling up to {args.crops_per_entity} crops each for {len(sightings_by_entity)} entities...")
 
@@ -162,7 +205,7 @@ def main():
     crops_by_gid = defaultdict(list)  # gid -> [np.ndarray, ...]
     for cam, targets in sample_targets_by_camera.items():
         cam_dir = f"camera_{int(cam):04d}"
-        cap = cv2.VideoCapture(str(scene_dir / cam_dir / "video.mp4"))
+        cap = cv2.VideoCapture(resolve_video_source(scene_dir / cam_dir))
         frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
@@ -216,43 +259,63 @@ def main():
                         x1, y1 = max(0, int(l)), max(0, int(t))
                         x2, y2 = min(w_img, int(l + w)), min(h_img, int(t + h))
                         if x2 > x1 and y2 > y1:
-                            crops_by_gid[gid].append(img[y1:y2, x1:x2, ::-1])  # BGR -> RGB
+                            crops_by_gid[gid].append(img[y1:y2, x1:x2])  # BGR, as read by cv2 -- kept
+                            # native for color_utils/crop_quality (both cv2-based); converted to RGB
+                            # only at the point of PIL image construction for the VLM, below.
                 frame_idx += 1
         cap.release()
 
     n_crops = sum(len(v) for v in crops_by_gid.values())
-    print(f"Extracted {n_crops} crops across {len(crops_by_gid)} entities, running BLIP captioning...")
+    print(f"Extracted {n_crops} crops across {len(crops_by_gid)} entities, running {CAPTION_MODEL_ID} captioning...")
 
-    processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-    blip = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to("cuda")
-    blip.eval()
+    processor = AutoProcessor.from_pretrained(CAPTION_MODEL_ID)
+    vlm = Qwen2_5_VLForConditionalGeneration.from_pretrained(CAPTION_MODEL_ID, torch_dtype=torch.bfloat16, device_map="cuda")
+    vlm.eval()
     embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
     human_words = GraphTools.HUMAN_CAPTION_WORDS
+
+    def caption_one(crop_bgr: np.ndarray) -> tuple:
+        """Returns (caption_text, confidence). Deterministic crop-quality gate runs FIRST -- a crop
+        that fails it never reaches the VLM at all, per the Phase 0 bake-off finding that models can't
+        be trusted to self-report uncertainty via prompting alone."""
+        if is_low_quality_crop(crop_bgr):
+            return UNCLEAR_CAPTION, 1.0  # confidence 1.0: this is a deterministic code decision, not
+            # a generation the confidence-gate below should second-guess.
+        upper = dominant_color_name(garment_region(crop_bgr, "upper"))
+        lower = dominant_color_name(garment_region(crop_bgr, "lower"))
+        image = Image.fromarray(crop_bgr[:, :, ::-1])  # BGR -> RGB for the VLM
+        messages = [{"role": "user", "content": [{"type": "image", "image": image},
+                                                   {"type": "text", "text": CONSTRAINED_PROMPT}]}]
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = processor(text=[text], images=[image], return_tensors="pt").to("cuda")
+        with torch.no_grad():
+            out = vlm.generate(**inputs, max_new_tokens=60, return_dict_in_generate=True, output_scores=True)
+        gen = out.sequences[:, inputs["input_ids"].shape[1]:]
+        garment_text = processor.batch_decode(gen, skip_special_tokens=True)[0].strip()
+        garment_text = strip_color_words(garment_text)  # the VLM's "no color" instruction is NOT
+        # reliable (confirmed in the bake-off) -- stripped here so it can never contradict the
+        # RGB-sampled colors below, rather than trusting the prompt alone.
+        token_probs = [torch.softmax(step_logits[0], dim=-1).max().item() for step_logits in out.scores]
+        confidence = sum(token_probs) / len(token_probs) if token_probs else 0.0
+        caption = f"{upper} top, {lower} bottom. {garment_text}"
+        return caption, confidence
 
     n_captioned = 0
     n_low_agreement = 0
     for gid, crops in crops_by_gid.items():
         captions = []
-        blip_confidences = []
+        caption_confidences = []
         for crop in crops:
-            image = Image.fromarray(crop)
-            inputs = processor(image, return_tensors="pt").to("cuda")
-            with torch.no_grad():
-                out = blip.generate(**inputs, max_new_tokens=30, return_dict_in_generate=True, output_scores=True)
-            captions.append(processor.decode(out.sequences[0], skip_special_tokens=True))
-            # Mean per-token max-softmax probability across the generated sequence -- BLIP's OWN
-            # confidence in its output, a different signal from cross-crop caption_agreement (a
-            # caption can be the only one sampled, or several crops can coincidentally agree, while
-            # BLIP itself was uncertain at every generation step).
-            token_probs = [torch.softmax(step_logits[0], dim=-1).max().item() for step_logits in out.scores]
-            blip_confidences.append(sum(token_probs) / len(token_probs) if token_probs else 0.0)
+            caption, confidence = caption_one(crop)
+            captions.append(caption)
+            caption_confidences.append(confidence)
 
         # A caption is excluded from medoid selection (never eligible as the consensus) if it's
-        # degenerate (decoder looping) OR BLIP itself generated it with low confidence -- still
+        # degenerate (decoder looping) OR the model itself generated it with low confidence -- still
         # recorded in all_captions/all_caption_confidences either way, just not trusted as consensus.
         valid_idxs = [i for i, c in enumerate(captions)
-                      if not is_degenerate_caption(c) and blip_confidences[i] >= BLIP_CONFIDENCE_THRESHOLD]
+                      if not is_degenerate_caption(c) and caption_confidences[i] >= CAPTION_CONFIDENCE_THRESHOLD]
         if not valid_idxs:
             valid_idxs = [0]  # every sample failed both checks -- no usable signal, but still need
             # something to store as appearance_caption
@@ -286,7 +349,7 @@ def main():
 
         G.nodes[f"entity:{gid}"]["appearance_caption"] = consensus
         G.nodes[f"entity:{gid}"]["all_captions"] = captions
-        G.nodes[f"entity:{gid}"]["all_caption_confidences"] = [round(c, 3) for c in blip_confidences]
+        G.nodes[f"entity:{gid}"]["all_caption_confidences"] = [round(c, 3) for c in caption_confidences]
         G.nodes[f"entity:{gid}"]["caption_agreement"] = round(agreement, 3)
         n_captioned += 1
         if agreement < 0.6:
@@ -295,6 +358,18 @@ def main():
             print(f"  ...{n_captioned}/{len(crops_by_gid)} ({n_low_agreement} low-agreement so far)")
 
     print(f"Captioned {n_captioned} entities ({n_low_agreement} with caption_agreement < 0.6)")
+
+    # Empirical check of CAPTION_CONFIDENCE_THRESHOLD's carryover-from-BLIP value, same discipline as
+    # the original BLIP 0.5->0.3 recalibration: print the REAL distribution so the constant above can
+    # be corrected if Qwen2.5-VL-3B's confidence calibration turns out to differ substantially.
+    all_confs = [c for gid in crops_by_gid for c in G.nodes[f"entity:{gid}"]["all_caption_confidences"]]
+    if all_confs:
+        arr = np.array(all_confs)
+        pct_excluded = float((arr < CAPTION_CONFIDENCE_THRESHOLD).mean() * 100)
+        print(f"Caption confidence distribution: mean={arr.mean():.3f} median={np.median(arr):.3f} "
+              f"p10={np.percentile(arr, 10):.3f} max={arr.max():.3f} -- "
+              f"{pct_excluded:.1f}% of all captions fall below CAPTION_CONFIDENCE_THRESHOLD={CAPTION_CONFIDENCE_THRESHOLD}")
+
     with open(args.out, "wb") as f:
         pickle.dump(G, f)
     print(f"Saved graph with attributes to {args.out}")

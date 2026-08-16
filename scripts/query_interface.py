@@ -68,8 +68,52 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "search_by_action",
+            "description": "Find ALL entities whose BEHAVIOR/ACTION matches a text query (e.g. 'walking', 'carrying "
+                            "something', 'standing still') at or above min_similarity -- NOT just the single best "
+                            "match, same reasoning as search_by_appearance (fragmentation means several entities "
+                            "usually match). Use this for questions about what someone was DOING, not what they "
+                            "looked like -- for appearance/clothing questions use search_by_appearance instead. "
+                            "action_description is a SEPARATE, independently-generated signal from "
+                            "appearance_caption (different model prompt, different source clips) -- don't assume "
+                            "an entity matched here also has a specific appearance, or vice versa, without checking. "
+                            "Each result also has action_agreement (0-1, same reliability meaning as "
+                            "caption_agreement but for behavior) -- treat a low or missing value as contested. "
+                            "Returns an empty list on a graph that hasn't had action description run on it yet -- "
+                            "say so plainly rather than treating that as 'no entity is doing X'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "min_similarity": {"type": "number", "default": 0.7,
+                                        "description": "Only return matches at or above this similarity."},
+                    "top_k": {"type": "integer", "default": 20, "description": "Safety cap on result count."},
+                },
+                "required": ["description"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_entity_timeline",
             "description": "Get the full sighting history (which cameras, when, where) for one entity by its global_id.",
+            "parameters": {
+                "type": "object",
+                "properties": {"global_id": {"type": "integer"}},
+                "required": ["global_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_entity_action",
+            "description": "Get the action_description (behavior, e.g. 'walking', 'standing still') and "
+                            "action_agreement for one entity by its global_id -- parallel to get_entity_timeline "
+                            "but for BEHAVIOR instead of position history. Use this when you already have a "
+                            "specific global_id and want to know what it was doing; use search_by_action instead "
+                            "when starting from a worded behavior description.",
             "parameters": {
                 "type": "object",
                 "properties": {"global_id": {"type": "integer"}},
@@ -299,15 +343,20 @@ single find_nearby_entities call, that only checks one candidate and silently ig
 - search_by_appearance returns MULTIPLE candidate entities on purpose -- treat all of them as possibly \
 relevant, not just the top one. A 1.0-similarity result is not more "correct" than the others, it just \
 means that entity's caption happens to repeat your query text -- it is still only one fragment among many.
-- Captions can be confidently wrong, especially about ACTIVITY or SCENE context (e.g. captions mentioning \
-"playing tennis" in this dataset are a known hallucination -- there is no tennis in these videos; the \
-model free-associates from a court-like floor texture). Color/clothing-type words in a caption are more \
-trustworthy than claims about what someone is doing or where. When a caption's activity claim seems \
-suspicious or irrelevant to the question, ignore that part rather than repeating it as fact.
-- Every entity's caption was independently generated from several different crops of it; caption_agreement \
-(0-1) measures how much those crops agreed. This dataset measured caption_agreement < 0.6 for roughly 3 \
-out of 4 entities -- so a low or missing caption_agreement is common, not rare, and should make you MORE \
-cautious about repeating that caption as fact, not just a minor footnote.
+- appearance_caption describes CLOTHING/ACCESSORIES ONLY -- it is generated under a prompt that \
+explicitly forbids activity, pose, or scene claims, and garment color specifically comes from direct \
+pixel sampling (not the captioning model's guess), so it should not contain activity claims at all. \
+If you ever see one anyway (an older graph, or a prompt failure), treat it the same as any other \
+uncertain claim -- don't repeat it as fact. A caption reading exactly "appearance unclear (low-quality \
+crop)" means the crop was too small/blurry to describe at all -- say so rather than treating it as a \
+real (if terse) description. If the entity also has an action_description field (a separate signal, \
+not always present), that is a different, still-uncertain claim about BEHAVIOR -- keep it distinct \
+from appearance_caption rather than blending the two in your answer.
+- Every entity's appearance_caption was independently generated from several different crops of it; \
+caption_agreement (0-1) measures how much those crops agreed. Low or missing caption_agreement should \
+make you MORE cautious about repeating that caption as fact, not just a minor footnote -- but don't \
+assume any particular rate of disagreement is typical across scenes/graphs, since it depends on the \
+specific pipeline run that produced the graph you're querying.
 - Cite your evidence: mention camera ids and timestamps that support your answer. Report time using the \
 tool's "start_time"/"end_time"/"time" fields (M:SS format) rather than the raw "*_time_sec" fields -- do \
 not convert seconds to M:SS yourself, use the pre-computed field so you can't get the arithmetic wrong.
@@ -1019,7 +1068,9 @@ def main():
     tools = GraphTools(args.graph)
     tool_fns = {
         "search_by_appearance": tools.search_by_appearance,
+        "search_by_action": tools.search_by_action,
         "get_entity_timeline": tools.get_entity_timeline,
+        "get_entity_action": tools.get_entity_action,
         "find_entities_in_camera": tools.find_entities_in_camera,
         "check_entities_cooccur": tools.check_entities_cooccur,
         "find_nearby_entities": tools.find_nearby_entities,

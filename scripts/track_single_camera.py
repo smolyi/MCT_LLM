@@ -21,6 +21,10 @@ import json
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+import reid_rect_patch  # noqa: F401 -- must be imported before any BoT-SORT+ReID tracker is
+# constructed; patches ultralytics' square-only, unnormalized ReID preprocessing to match this
+# project's rectangular, ImageNet-normalized OSNet convention. A no-op for ByteTrack/ReID-less runs.
+from video_source import resolve_track_source
 
 # COCO class ids we care about for this project's entity/event vocabulary.
 CLASSES_OF_INTEREST = {0: "person", 2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
@@ -46,7 +50,7 @@ def main():
     from ultralytics import YOLO
 
     camera_dir = Path(args.camera)
-    video_path = camera_dir / "video.mp4"
+    video_path = resolve_track_source(camera_dir)
     out_path = Path(args.out) if args.out else camera_dir / "tracks.jsonl"
 
     model = YOLO(args.model)

@@ -1,0 +1,25 @@
+# BoT-SORT + this project's own OSNet-Market1501 ReID checkpoint (exported to ONNX via
+# scripts/export_osnet_onnx.py), for appearance-aware single-camera tracking -- addresses the
+# confirmed root cause of within-camera fragmentation (ByteTrack's own per-frame ID-swap
+# ambiguity under occlusion/crowd density, already documented in CLAUDE.md as a deferred fix).
+# Deliberately reuses the SAME already-vetted checkpoint used throughout this project's ReID
+# steps (not ultralytics' bundled yolo26-reid.onnx, whose training data provenance isn't
+# documented -- see CLAUDE.md's "ReID model chosen" note for why that was rejected originally).
+
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 30
+match_thresh: 0.8
+fuse_score: True
+
+gmc_method: sparseOptFlow
+
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: True
+model: checkpoints/osnet_x1_0_market1501.pth
+# .pth suffix routes through reid_rect_patch.py's TorchReIDEncoder (PyTorch/CUDA, bypassing
+# ONNX Runtime's CUDAExecutionProvider entirely -- confirmed via nvidia-smi to silently run at
+# near-CPU speed on this machine despite being "selected").

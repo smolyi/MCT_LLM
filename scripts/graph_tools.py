@@ -45,6 +45,13 @@ class GraphTools:
         self._caption_gids = gids
         self._caption_embeddings = self.embedder.encode(captions, normalize_embeddings=True) if captions else np.zeros((0, 384))
 
+        # action_description is optional -- only present on graphs that have run
+        # extract_entity_actions.py (Phase 4) -- so this index can legitimately be empty.
+        action_gids = [gid for gid, d in self.entities.items() if "action_description" in d]
+        actions = [self.entities[gid]["action_description"] for gid in action_gids]
+        self._action_gids = action_gids
+        self._action_embeddings = self.embedder.encode(actions, normalize_embeddings=True) if actions else np.zeros((0, 384))
+
     def _sightings_of(self, gid: int) -> list:
         return [d for n, d in self.G.nodes(data=True) if d["type"] == "sighting" and d["global_id"] == gid]
 
@@ -78,6 +85,46 @@ class GraphTools:
             }
             for i in idx
         ]
+
+    def search_by_action(self, description: str, min_similarity: float = 0.7, top_k: int = 20) -> list:
+        """Find ALL entities whose action_description semantically matches a text description
+        (e.g. "walking", "carrying something") at or above min_similarity -- same shape and same
+        reasoning as search_by_appearance (a description usually matches several fragment entities,
+        not one), but over BEHAVIOR instead of appearance. Returns [] on a graph that hasn't run
+        extract_entity_actions.py yet, same as searching an appearance-less graph would."""
+        if len(self._action_gids) == 0:
+            return []
+        query_emb = self.embedder.encode([description], normalize_embeddings=True)[0]
+        sims = self._action_embeddings @ query_emb
+        idx = np.argsort(-sims)
+        idx = [i for i in idx if sims[i] >= min_similarity][:top_k]
+        return [
+            {
+                "global_id": int(self._action_gids[i]),
+                "action_description": self.entities[self._action_gids[i]]["action_description"],
+                "similarity": round(float(sims[i]), 3),
+                "action_agreement": self.entities[self._action_gids[i]].get("action_agreement"),
+            }
+            for i in idx
+        ]
+
+    def get_entity_action(self, global_id: int) -> dict:
+        """action_description + action_agreement for one entity -- parallel to get_entity_timeline,
+        but for behavior instead of the full sighting/position history. A separate, still-uncertain
+        signal from appearance_caption -- keep the two distinct rather than blending them (see
+        query_interface.py's system prompt)."""
+        if global_id not in self.entities:
+            return {"error": f"no entity with global_id={global_id}"}
+        d = self.entities[global_id]
+        if "action_description" not in d:
+            return {"global_id": global_id, "error": "no action_description on this entity -- "
+                    "this graph may not have run extract_entity_actions.py yet"}
+        return {
+            "global_id": global_id,
+            "action_description": d["action_description"],
+            "action_agreement": d.get("action_agreement"),
+            "all_actions": d.get("all_actions"),
+        }
 
     def get_entity_timeline(self, global_id: int) -> dict:
         """Full sighting history for one entity: which cameras, when, where (world coords)."""

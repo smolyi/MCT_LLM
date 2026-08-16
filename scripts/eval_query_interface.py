@@ -163,7 +163,9 @@ def main():
     tools = GraphTools(args.graph)
     tool_fns = {
         "search_by_appearance": tools.search_by_appearance,
+        "search_by_action": tools.search_by_action,
         "get_entity_timeline": tools.get_entity_timeline,
+        "get_entity_action": tools.get_entity_action,
         "find_entities_in_camera": tools.find_entities_in_camera,
         "check_entities_cooccur": tools.check_entities_cooccur,
         "find_nearby_entities": tools.find_nearby_entities,

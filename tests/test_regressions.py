@@ -22,7 +22,16 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
-from extract_entity_attributes import is_degenerate_caption, BLIP_CONFIDENCE_THRESHOLD
+import numpy as np
+
+from color_utils import strip_color_words, dominant_color_name, garment_region, NAMED_COLORS_RGB, MIN_GARMENT_REGION_PIXELS
+from crop_quality import is_low_quality_crop, MIN_CROP_AREA_PX
+from cross_camera_reid import (
+    plausibility_matrix, match_pairs, merge_would_violate_same_camera_overlap, UnionFind,
+    consolidate_group_representatives, SAME_CAMERA_OVERLAP_GRACE_FRAMES,
+    HANDOFF_GAP_FRAMES, HANDOFF_PIXEL_DIST, HANDOFF_OVERRIDE_SIM,
+)
+from extract_entity_attributes import is_degenerate_caption, CAPTION_CONFIDENCE_THRESHOLD
 from graph_tools import GraphTools
 from query_interface import (
     agreement_flag,
@@ -418,24 +427,30 @@ class TestDeterministicReportsNeverRetyped(unittest.TestCase):
         self.assertIn("5: 3 confirmed", answer)  # the intro's claim about id 5 is verified, so kept
 
 
-class TestBlipConfidenceThresholdCalibration(unittest.TestCase):
-    """Bug: an initial guess of BLIP_CONFIDENCE_THRESHOLD=0.5 was checked
-    against the real distribution of 2063 sampled captions (mean 0.412,
-    median 0.409, p90 0.508) and found to exclude 88% of ALL captions, not
-    just outliers -- effectively disabling the multi-crop consensus
-    mechanism for nearly every entity. Recalibrated to 0.3 (~p10). This
-    test doesn't re-derive the distribution (that needs the real dataset --
-    see test_graph_integration.py) but guards against the threshold being
-    silently pushed back into the range that was empirically shown broken."""
+class TestCaptionConfidenceThresholdCalibration(unittest.TestCase):
+    """Bug (BLIP era): an initial guess of 0.5 was checked against the real distribution of 2063
+    sampled BLIP captions (mean 0.412, median 0.409, p90 0.508) and found to exclude 88% of ALL
+    captions, not just outliers -- effectively disabling the multi-crop consensus mechanism for
+    nearly every entity. Recalibrated to 0.3 (~p10 of BLIP's distribution).
 
-    def test_threshold_is_not_the_known_bad_value(self):
-        self.assertNotEqual(BLIP_CONFIDENCE_THRESHOLD, 0.5)
+    Renamed BLIP_CONFIDENCE_THRESHOLD -> CAPTION_CONFIDENCE_THRESHOLD when the captioning model
+    switched to Qwen2.5-VL-3B (captions/matching/actions work) -- re-checked against Qwen's real
+    distribution (193+ real POM captions: min=0.921, p10=0.975, mean=0.992) and found NOT to
+    transfer as a useful signal at all (no meaningful low-confidence tail for this model's short,
+    templated task). Deliberately left at 0.3 anyway, as an effectively-inert safety net rather
+    than a real per-model recalibration -- this test guards against a FUTURE accidental push into
+    the 0.9-1.0 range, which WOULD start excluding real captions again (repeating the original
+    88%-exclusion regression, just via a different, backwards route)."""
 
-    def test_threshold_is_in_the_calibrated_range(self):
-        # Calibrated against p10 (~0.316) of the real distribution -- anything meaningfully above
-        # that would repeat the 88%-exclusion regression; anything at 0 would disable the check.
-        self.assertGreater(BLIP_CONFIDENCE_THRESHOLD, 0.0)
-        self.assertLess(BLIP_CONFIDENCE_THRESHOLD, 0.4)
+    def test_threshold_is_not_the_known_bad_blip_value(self):
+        self.assertNotEqual(CAPTION_CONFIDENCE_THRESHOLD, 0.5)
+
+    def test_threshold_stays_in_the_inert_safety_net_range(self):
+        # Must stay well below Qwen2.5-VL-3B's real observed range (0.921-1.0) or it would start
+        # excluding real, good captions -- the exact class of regression this constant's whole
+        # history is about.
+        self.assertGreater(CAPTION_CONFIDENCE_THRESHOLD, 0.0)
+        self.assertLess(CAPTION_CONFIDENCE_THRESHOLD, 0.9)
 
 
 class TestCaptionAgreementThresholdConsistency(unittest.TestCase):
@@ -446,6 +461,390 @@ class TestCaptionAgreementThresholdConsistency(unittest.TestCase):
 
     def test_threshold_is_the_documented_value(self):
         self.assertEqual(CAPTION_AGREEMENT_THRESHOLD, 0.6)
+
+
+class TestColorWordStripping(unittest.TestCase):
+    """Bug: strip_color_words' first version only matched whole tokens against COLOR_STOPWORDS, so
+    hyphenated compounds like "dark-colored jacket" sailed straight through untouched (neither
+    "dark-colored" nor "dark" nor "colored" is itself in the stopword set as a standalone token
+    match). Real, observed leak in extract_entity_attributes.py output: "The person is wearing a
+    dark-colored jacket." Fixed by also splitting each token on '-' and checking its parts."""
+
+    def test_strips_plain_color_word(self):
+        self.assertEqual(strip_color_words("a black jacket"), "a jacket")
+
+    def test_strips_hyphenated_color_compound(self):
+        result = strip_color_words("a dark-colored jacket")
+        self.assertNotIn("dark-colored", result)
+        self.assertIn("jacket", result)
+
+    def test_strips_hyphenated_compound_at_start(self):
+        result = strip_color_words("light-colored pants and a red-and-white scarf")
+        self.assertNotIn("light-colored", result)
+        self.assertNotIn("red-and-white", result)
+        self.assertIn("pants", result)
+        self.assertIn("scarf", result)
+
+    def test_leaves_non_color_words_untouched(self):
+        self.assertEqual(strip_color_words("a jacket and jeans"), "a jacket and jeans")
+
+
+class TestDominantColorNaming(unittest.TestCase):
+    """dominant_color_name should recover a color close to a synthetic solid-color region's actual
+    RGB value -- a basic sanity check that the k-means + nearest-Lab-distance pipeline isn't
+    accidentally inverted or channel-swapped (the exact class of bug that once made every ReID crop's
+    color signal silently wrong via an unflipped BGR/RGB mismatch elsewhere in this project)."""
+
+    def test_solid_black_region_is_named_black(self):
+        region_rgb = np.full((40, 40, 3), NAMED_COLORS_RGB["black"], dtype=np.uint8)
+        region_bgr = region_rgb[:, :, ::-1]
+        self.assertEqual(dominant_color_name(region_bgr), "black")
+
+    def test_solid_red_region_is_named_red_not_blue(self):
+        # Specifically checks channel order isn't swapped -- a red region should never be named
+        # "blue" (or vice versa), which is exactly what a BGR/RGB mixup would produce.
+        region_rgb = np.full((40, 40, 3), NAMED_COLORS_RGB["red"], dtype=np.uint8)
+        region_bgr = region_rgb[:, :, ::-1]
+        name = dominant_color_name(region_bgr)
+        self.assertNotEqual(name, "blue")
+        self.assertNotEqual(name, "dark blue")
+
+    def test_empty_region_returns_unknown(self):
+        self.assertEqual(dominant_color_name(np.zeros((0, 0, 3), dtype=np.uint8)), "unknown")
+
+
+class TestCropQualityGateCalibration(unittest.TestCase):
+    """Bug: the first crop-quality gate was calibrated against a RANDOM (camera, frame) sample from
+    pred_full.txt (p5 area=1135) -- a different, larger-skewing population than what
+    extract_entity_attributes.py actually samples (crops spread across each entity's own
+    trajectory, real p5 area=364). Applied blindly, this flagged 41% of all 934 real POM entities
+    as "unclear" instead of a real ~8%. Recalibrated to area-only (>=400px, from direct visual
+    inspection of real confirmed-bad ~266-290px examples vs. a confirmed-legible ~624px one),
+    dropping a WIDTH-only rule that had separately, incorrectly rejected a legible 16x185px crop
+    (narrow only because the person was captured in a tight upright bbox)."""
+
+    def test_tiny_area_crop_is_flagged_low_quality(self):
+        # 10x20 = 200px area, well below MIN_CROP_AREA_PX -- a real confirmed-bad example was
+        # 266-290px area.
+        crop = np.random.randint(0, 255, (20, 10, 3), dtype=np.uint8)
+        self.assertTrue(is_low_quality_crop(crop))
+
+    def test_narrow_but_tall_crop_is_not_rejected_by_width_alone(self):
+        # Regression for the width-only false rejection: 16px wide x 185px tall (area=2960, well
+        # above threshold) was a real, legible crop the first version wrongly rejected. Uses varied
+        # pixel values (not flat) so the Laplacian-variance blur check also passes.
+        crop = np.random.randint(0, 255, (185, 16, 3), dtype=np.uint8)
+        self.assertFalse(is_low_quality_crop(crop))
+
+    def test_area_threshold_is_between_confirmed_bad_and_confirmed_good_examples(self):
+        # 266-290px (confirmed bad via direct visual inspection) < threshold < 624px (confirmed
+        # legible) -- guards against the threshold drifting back toward either extreme.
+        self.assertGreater(MIN_CROP_AREA_PX, 290)
+        self.assertLess(MIN_CROP_AREA_PX, 624)
+
+    def test_empty_crop_is_flagged_low_quality(self):
+        self.assertTrue(is_low_quality_crop(np.zeros((0, 0, 3), dtype=np.uint8)))
+
+
+class TestSameCameraOverlapVeto(unittest.TestCase):
+    """The single highest-risk detail identified before implementing within-camera identity
+    stitching: plausibility_matrix's cross-camera overlap rule only vetoes overlapping tracks that
+    are ALSO far apart (dist > OVERLAP_DISTANCE_TOLERANCE_M=3.0) -- correct cross-camera (two
+    cameras can legitimately see the same person from different angles at once), but WRONG if reused
+    unchanged for same-camera pairs, where two simultaneously-visible boxes are always two different
+    people regardless of distance. plausibility_matrix's same_camera=True branch must give an
+    ABSOLUTE veto (any overlap -> 0), not the distance-conditional cross-camera one."""
+
+    def _overlapping_close_tracks(self):
+        # Two tracks active in the exact same frame window, 1m apart -- well within the 3m
+        # cross-camera tolerance, so a same_camera=False call should NOT veto this pair.
+        first_a, last_a = np.array([100]), np.array([200])
+        pos_a = np.array([[0.0, 0.0]])
+        first_b, last_b = np.array([100]), np.array([200])
+        pos_b = np.array([[1.0, 0.0]])
+        return first_a, last_a, pos_a, first_b, last_b, pos_b
+
+    def test_same_camera_overlap_is_hard_vetoed_regardless_of_close_distance(self):
+        args = self._overlapping_close_tracks()
+        plaus = plausibility_matrix(*args, same_camera=True)
+        self.assertEqual(plaus[0, 0], 0.0)
+
+    def test_cross_camera_overlap_within_tolerance_is_not_vetoed(self):
+        # Real finding while writing this test, not previously documented: the explicit "overlap
+        # AND dist > 3.0m -> 0" veto is almost redundant for cross-camera pairs, because the
+        # GENERIC required_speed=dist/gap_sec formula already drives plausibility to ~0 for any
+        # overlapping pair beyond ~0.1m (gap_sec is floored at 1 frame for an overlapping pair, so
+        # even a modest distance implies an enormous required speed). The 1m-apart case above
+        # (within the 3.0m explicit-veto tolerance) still lands at exactly 0 via this generic path,
+        # not the hard veto -- only genuinely near-zero distances get real credit during overlap.
+        # Not changed here (it's pre-existing behavior, not something this session's within-camera
+        # work touched, and changing it would affect already-reported quantitative baselines) --
+        # flagged honestly instead of silently asserting around it.
+        first_a, last_a = np.array([100]), np.array([200])
+        pos_a = np.array([[0.0, 0.0]])
+        first_b, last_b = np.array([100]), np.array([200])
+        pos_b = np.array([[0.02, 0.0]])  # 2cm apart -- genuinely near-zero distance
+        plaus = plausibility_matrix(first_a, last_a, pos_a, first_b, last_b, pos_b, same_camera=False)
+        self.assertGreater(plaus[0, 0], 0.0)
+
+    def test_cross_camera_overlap_beyond_tolerance_is_still_vetoed(self):
+        first_a, last_a = np.array([100]), np.array([200])
+        pos_a = np.array([[0.0, 0.0]])
+        first_b, last_b = np.array([100]), np.array([200])
+        pos_b = np.array([[10.0, 0.0]])  # 10m apart, well beyond the 3m tolerance
+        plaus = plausibility_matrix(first_a, last_a, pos_a, first_b, last_b, pos_b, same_camera=False)
+        self.assertEqual(plaus[0, 0], 0.0)
+
+
+class TestFrameRangeWideningRegression(unittest.TestCase):
+    """Bug: cross_camera_reid.py's within-camera group consolidation originally widened a group's
+    frame range to min/max across ALL members, which artificially inflated a group's temporal
+    footprint and spuriously triggered the overlap branch above against unrelated cross-camera
+    candidates -- collapsing real spanning matches from 121 to 13 in the first version. This test
+    encodes the underlying mechanism directly: the SAME pair of tracks must be plausible (a
+    legitimate sequential, walkable-gap candidate) when using a TIGHT frame range, but implausible
+    once one track's window is artificially widened to overlap the other -- confirming why the fix
+    (using a group representative's own tight range, not a widened envelope) matters."""
+
+    def test_tight_frame_ranges_yield_plausible_sequential_match(self):
+        # Track A ends at frame 100, track B starts at frame 130 (1 second gap @ 30fps) -- an easy
+        # walking-pace gap for two positions 1m apart.
+        first_a, last_a, pos_a = np.array([50]), np.array([100]), np.array([[0.0, 0.0]])
+        first_b, last_b, pos_b = np.array([130]), np.array([180]), np.array([[1.0, 0.0]])
+        plaus = plausibility_matrix(first_a, last_a, pos_a, first_b, last_b, pos_b, same_camera=False)
+        self.assertGreater(plaus[0, 0], 0.5)
+
+    def test_widened_frame_range_spuriously_collapses_the_same_pair(self):
+        # Same two tracks, but track A's window is now widened (as the buggy consolidation once
+        # did) to span all the way to frame 200 -- now overlapping track B's window entirely, even
+        # though the underlying physical encounter is unchanged.
+        first_a, last_a, pos_a = np.array([50]), np.array([200]), np.array([[0.0, 0.0]])
+        first_b, last_b, pos_b = np.array([130]), np.array([180]), np.array([[1.0, 0.0]])
+        plaus = plausibility_matrix(first_a, last_a, pos_a, first_b, last_b, pos_b, same_camera=False)
+        self.assertLess(plaus[0, 0], 0.5)
+
+
+class TestCaptionSimilarityAdditiveCombination(unittest.TestCase):
+    """match_pairs combines appearance and caption similarity ADDITIVELY
+    (w_appearance * appearance_sim + w_caption * caption_sim), not as another hard multiplicative
+    gate, and falls back to appearance-only for any pair missing a caption embedding rather than
+    penalizing missing data. Verified via real POM evaluation that a non-trivial w_caption can
+    increase over-merging risk on a population with generic clothing (see CLAUDE.md) -- kept
+    disabled by default there, but the combination math itself must stay correct regardless."""
+
+    def _two_track_setup(self, with_captions: bool):
+        keys = [("cam0", 1), ("cam0", 2)]
+        embeddings = {("cam0", 1): np.array([1.0, 0.0]), ("cam0", 2): np.array([1.0, 0.0])}
+        world_pos = {k: np.array([0.0, 0.0]) for k in keys}
+        first_frame = {("cam0", 1): 0, ("cam0", 2): 10000}  # far apart in time -> full plausibility
+        last_frame = {("cam0", 1): 5, ("cam0", 2): 10005}
+        caption_embeddings = None
+        if with_captions:
+            # Identical appearance, but caption embeddings anti-correlated -- if the additive
+            # combination is working, this should pull the combined score DOWN from pure appearance.
+            caption_embeddings = {("cam0", 1): np.array([1.0, 0.0]), ("cam0", 2): np.array([-1.0, 0.0])}
+        return keys, embeddings, world_pos, first_frame, last_frame, caption_embeddings
+
+    def test_missing_caption_embeddings_falls_back_to_appearance_only(self):
+        keys, embeddings, world_pos, first_frame, last_frame, _ = self._two_track_setup(with_captions=False)
+        pairs = match_pairs([keys[0]], [keys[1]], embeddings, world_pos, first_frame, last_frame,
+                             threshold=0.99, same_camera=False, caption_embeddings=None)
+        # Appearance similarity is 1.0 (identical vectors) and plausibility is full -> should match
+        # at a threshold just below 1.0.
+        self.assertEqual(pairs, [(keys[0], keys[1])])
+
+    def test_caption_similarity_pulls_combined_score_down_when_anti_correlated(self):
+        keys, embeddings, world_pos, first_frame, last_frame, caption_embeddings = self._two_track_setup(with_captions=True)
+        # Same appearance (sim=1.0) as the fallback case, but now anti-correlated captions
+        # (cap_sim=-1.0) with w_caption=0.5 should pull the combined score down to 0.5*1.0 +
+        # 0.5*(-1.0) = 0.0, well below a high threshold that passed in the no-caption case above.
+        pairs = match_pairs([keys[0]], [keys[1]], embeddings, world_pos, first_frame, last_frame,
+                             threshold=0.99, same_camera=False, caption_embeddings=caption_embeddings,
+                             w_appearance=0.5, w_caption=0.5)
+        self.assertEqual(pairs, [])
+
+
+class TestSameCameraOverlapTransitiveInvariant(unittest.TestCase):
+    """Real user-raised concern: the same-camera hard veto in plausibility_matrix only guards a
+    SINGLE Hungarian call's own direct matches. During the cross-camera pass, group A could match
+    group C via camera-pair (0,2), and group B could separately match group C via camera-pair
+    (1,2) -- two independent, individually-valid Hungarian results that transitively fuse A and B
+    through their shared root, even though A and B were never compared directly. If A and B both
+    contain same-camera-overlapping raw tracks (a real physical impossibility), that fusion would
+    silently reintroduce it. merge_would_violate_same_camera_overlap must catch this."""
+
+    def test_detects_violation_introduced_via_third_group(self):
+        # Track A (cam0, frames 0-100) and track B (cam0, frames 50-150) overlap in the SAME
+        # camera -- two different physical people, by construction. Track C (cam1) already got
+        # unioned with A (simulating an earlier, independent cross-camera match).
+        all_keys = [("cam0", 1), ("cam0", 2), ("cam1", 1)]
+        first_frame = {("cam0", 1): 0, ("cam0", 2): 50, ("cam1", 1): 200}
+        last_frame = {("cam0", 1): 100, ("cam0", 2): 150, ("cam1", 1): 300}
+        uf = UnionFind(all_keys)
+        uf.union(("cam0", 1), ("cam1", 1))  # A and C already fused (an earlier valid cross-camera match)
+        # Now checking whether B can also join C's group -- it must NOT be allowed, since that
+        # would transitively put A (cam0, 0-100) and B (cam0, 50-150) in the same entity.
+        violates = merge_would_violate_same_camera_overlap(
+            all_keys, uf, ("cam0", 2), ("cam1", 1), first_frame, last_frame)
+        self.assertTrue(violates)
+
+    def test_allows_merge_with_no_overlap(self):
+        all_keys = [("cam0", 1), ("cam0", 2), ("cam1", 1)]
+        first_frame = {("cam0", 1): 0, ("cam0", 2): 500, ("cam1", 1): 200}  # cam0 tracks don't overlap
+        last_frame = {("cam0", 1): 100, ("cam0", 2): 600, ("cam1", 1): 300}
+        uf = UnionFind(all_keys)
+        uf.union(("cam0", 1), ("cam1", 1))
+        violates = merge_would_violate_same_camera_overlap(
+            all_keys, uf, ("cam0", 2), ("cam1", 1), first_frame, last_frame)
+        self.assertFalse(violates)
+
+
+class TestGarmentRegionMinimumSize(unittest.TestCase):
+    """Real bug, user-reported: a 38x13px crop (494px total area -- large enough to pass
+    crop_quality's coarser area>=400 gate) sliced down to a ~72px garment region gave "black" for
+    a crop that was genuinely cream/beige (confirmed by direct visual inspection); the SAME
+    person's larger crops (580px+ garment region) correctly gave "beige". crop_quality's gate
+    operates on the WHOLE crop, not garment_region()'s sub-slice, so a crop can pass it and still
+    leave too few pixels for k-means to find a real color cluster. dominant_color_name must return
+    "unknown" rather than guess when the region is too small."""
+
+    def test_tiny_region_returns_unknown_not_a_guess(self):
+        # ~72px, matching the real confirmed-bad case's approximate scale.
+        region = np.random.randint(0, 255, (9, 8, 3), dtype=np.uint8)
+        self.assertEqual(dominant_color_name(region), "unknown")
+
+    def test_adequately_sized_region_is_not_forced_to_unknown(self):
+        region = np.full((30, 30, 3), NAMED_COLORS_RGB["beige"], dtype=np.uint8)
+        self.assertNotEqual(dominant_color_name(region), "unknown")
+
+    def test_threshold_is_below_the_real_legitimate_population(self):
+        # Calibrated against a real 18-crop sample's garment-region sizes (p5=450px) -- must stay
+        # comfortably below that or legitimate crops would start getting "unknown" too.
+        self.assertLess(MIN_GARMENT_REGION_PIXELS, 450)
+        self.assertGreater(MIN_GARMENT_REGION_PIXELS, 72)
+
+
+class TestSameCameraBoundaryTouchNotVetoed(unittest.TestCase):
+    """Real bug found via direct visual inspection (user-raised: "only ~10 people, must be a bug"):
+    a same-camera track pair touching at the EXACT boundary frame (track A's last frame == track
+    B's first frame -- a classic ID-switch handoff, confirmed concretely on POM camera_0000 tracks
+    419/488, literally the same detection at the same frame) was being hard-vetoed by the same-
+    camera overlap rule's `first_b <= last_a` check, which is True at a zero-duration touch. Fixed
+    by requiring overlap DURATION to exceed SAME_CAMERA_OVERLAP_GRACE_FRAMES before vetoing."""
+
+    def test_exact_boundary_touch_is_not_vetoed(self):
+        first_a, last_a, pos_a = np.array([100]), np.array([300]), np.array([[0.0, 0.0]])
+        first_b, last_b, pos_b = np.array([300]), np.array([500]), np.array([[0.0, 0.0]])
+        plaus = plausibility_matrix(first_a, last_a, pos_a, first_b, last_b, pos_b, same_camera=True)
+        self.assertGreater(plaus[0, 0], 0.0)
+
+    def test_overlap_beyond_grace_window_is_still_vetoed(self):
+        # Real overlap duration well beyond the grace window -- must still be a hard veto.
+        first_a, last_a, pos_a = np.array([100]), np.array([300]), np.array([[0.0, 0.0]])
+        first_b, last_b, pos_b = np.array([150]), np.array([350]), np.array([[0.0, 0.0]])
+        overlap_duration = min(300, 350) - max(100, 150)
+        self.assertGreater(overlap_duration, SAME_CAMERA_OVERLAP_GRACE_FRAMES)
+        plaus = plausibility_matrix(first_a, last_a, pos_a, first_b, last_b, pos_b, same_camera=True)
+        self.assertEqual(plaus[0, 0], 0.0)
+
+
+class TestCleanHandoffOverridesNoisyAppearance(unittest.TestCase):
+    """Real bug found via direct visual inspection: several confirmed real same-person handoffs had
+    appearance similarity as low as 0.59 (motion blur/tiny-crop noise), which no reasonable
+    appearance-only threshold could accept without also accepting false positives elsewhere. A
+    "clean handoff" (tight time gap AND tight pixel-space displacement) should OVERRIDE a noisy
+    appearance score for same-camera matching. Two sub-bugs guarded here: the confidence formula
+    must give FULL credit within the calibrated range (not decay linearly from zero), and the
+    handoff score must apply AFTER plausibility multiplication, not be silently zeroed by the same
+    unreliable world-position-based plausibility it exists to route around."""
+
+    def _setup(self, appearance_sim: float, gap_frames: int, px_dist: float):
+        keys = [("cam0", 1), ("cam0", 2)]
+        # Anti-correlated-ish embeddings scaled to produce the desired cosine similarity isn't
+        # trivial with raw vectors; use two 2D unit vectors at a controlled angle instead.
+        theta = np.arccos(np.clip(appearance_sim, -1, 1))
+        embeddings = {("cam0", 1): np.array([1.0, 0.0]), ("cam0", 2): np.array([np.cos(theta), np.sin(theta)])}
+        first_frame = {("cam0", 1): 100, ("cam0", 2): 100 + gap_frames}
+        last_frame = {("cam0", 1): 100, ("cam0", 2): 100 + gap_frames + 50}
+        # World position kept identical (irrelevant/misleading on purpose -- the point is the
+        # handoff signal must not depend on it) but far apart, to confirm the override bypasses a
+        # bad plausibility reading, matching the real diagnosed case.
+        world_pos = {("cam0", 1): np.array([0.0, 0.0]), ("cam0", 2): np.array([900.0, 900.0])}
+        first_pixel_pos = {("cam0", 1): np.array([0.0, 0.0]), ("cam0", 2): np.array([px_dist, 0.0])}
+        last_pixel_pos = {("cam0", 1): np.array([0.0, 0.0]), ("cam0", 2): np.array([px_dist, 0.0])}
+        return keys, embeddings, world_pos, first_frame, last_frame, first_pixel_pos, last_pixel_pos
+
+    def test_clean_handoff_rescues_low_appearance_similarity(self):
+        keys, embeddings, world_pos, first_frame, last_frame, first_pixel_pos, last_pixel_pos = self._setup(
+            appearance_sim=0.59, gap_frames=6, px_dist=20)
+        pairs = match_pairs([keys[0]], [keys[1]], embeddings, world_pos, first_frame, last_frame,
+                             threshold=0.75, same_camera=True,
+                             first_pixel_pos=first_pixel_pos, last_pixel_pos=last_pixel_pos)
+        self.assertEqual(pairs, [(keys[0], keys[1])])
+
+    def test_far_handoff_does_not_rescue_low_appearance_similarity(self):
+        keys, embeddings, world_pos, first_frame, last_frame, first_pixel_pos, last_pixel_pos = self._setup(
+            appearance_sim=0.59, gap_frames=200, px_dist=500)
+        pairs = match_pairs([keys[0]], [keys[1]], embeddings, world_pos, first_frame, last_frame,
+                             threshold=0.75, same_camera=True,
+                             first_pixel_pos=first_pixel_pos, last_pixel_pos=last_pixel_pos)
+        self.assertEqual(pairs, [])
+
+    def test_no_pixel_position_data_falls_back_gracefully(self):
+        keys, embeddings, world_pos, first_frame, last_frame, _, _ = self._setup(
+            appearance_sim=0.59, gap_frames=6, px_dist=20)
+        # No crash, no phantom match, when pixel position data isn't available.
+        pairs = match_pairs([keys[0]], [keys[1]], embeddings, world_pos, first_frame, last_frame,
+                             threshold=0.75, same_camera=True)
+        self.assertEqual(pairs, [])
+
+
+class TestIterativeStitchingResolvesChains(unittest.TestCase):
+    """Real bug found via direct visual inspection: a single Hungarian round enforces at most one
+    match per track, so a person fragmented into 3+ pieces could only pair up floor(n/2) of them per
+    round even with every pairwise similarity above threshold (confirmed: 419 matched to 749, 488
+    matched to 928 in round 1, even though 419-488 themselves scored above threshold). This test
+    encodes the mechanism directly: consolidate_group_representatives, called iteratively across
+    rounds via a shared UnionFind, must eventually fuse a 4-track chain that a single round cannot."""
+
+    def test_four_track_chain_resolves_after_two_rounds(self):
+        # A: matches C well; B: matches D well; but A-C and B-D are the round-1 Hungarian optimum,
+        # leaving the true A-B link (via C/D's consolidated representatives) for round 2.
+        keys = [("cam0", "A"), ("cam0", "B"), ("cam0", "C"), ("cam0", "D")]
+        embeddings = {
+            ("cam0", "A"): np.array([1.0, 0.0]),
+            ("cam0", "C"): np.array([0.99, np.sqrt(1 - 0.99 ** 2)]),  # A's best round-1 match
+            ("cam0", "B"): np.array([0.0, 1.0]) * -1 + np.array([1.0, 0.0]) * 0.8,  # placeholder, overwritten below
+            ("cam0", "D"): np.array([1.0, 0.0]),
+        }
+        # Simpler, explicit construction: A and C are near-identical (best round-1 pair); B and D
+        # are near-identical (the other round-1 pair); A/B are similar enough to merge once C/D's
+        # groups are each represented by a single point close to A and B respectively.
+        embeddings[("cam0", "A")] = np.array([1.0, 0.0])
+        embeddings[("cam0", "C")] = np.array([0.999, np.sqrt(1 - 0.999 ** 2)])
+        embeddings[("cam0", "B")] = np.array([0.97, np.sqrt(1 - 0.97 ** 2)])
+        embeddings[("cam0", "D")] = np.array([0.971, np.sqrt(1 - 0.971 ** 2)])
+        world_pos = {k: np.array([0.0, 0.0]) for k in keys}
+        # Non-overlapping, walkable-gap frame ranges for every pair (dist=0 everywhere -> full
+        # plausibility regardless of gap).
+        first_frame = {("cam0", "A"): 0, ("cam0", "C"): 10000, ("cam0", "B"): 20000, ("cam0", "D"): 30000}
+        last_frame = {("cam0", "A"): 5, ("cam0", "C"): 10005, ("cam0", "B"): 20005, ("cam0", "D"): 30005}
+
+        uf = UnionFind(keys)
+        threshold = 0.9
+        for _ in range(5):
+            reps, group_members = consolidate_group_representatives(keys, uf, embeddings, first_frame, last_frame, world_pos)
+            pairs = match_pairs(reps, reps, embeddings, world_pos, first_frame, last_frame,
+                                 threshold, same_camera=True)
+            if not pairs:
+                break
+            for a, b in pairs:
+                uf.union(a, b)
+
+        roots = {k: uf.find(k) for k in keys}
+        # All 4 should end up in the same group after enough rounds, even though A-B and C-D were
+        # never each other's best single-round match.
+        self.assertEqual(len(set(roots.values())), 1, f"expected all 4 keys in one group, got {roots}")
 
 
 if __name__ == "__main__":

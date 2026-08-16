@@ -155,5 +155,53 @@ class TestRankEntitiesByInteractionCount(GraphIntegrationTestCase):
         self.assertGreater(max(counts), 10)
 
 
+class TestActionToolsGracefulOnGraphWithoutActions(GraphIntegrationTestCase):
+    """search_by_action/get_entity_action must degrade gracefully (not crash) on a graph that
+    hasn't run extract_entity_actions.py yet -- scene_061's real graph is exactly this case as of
+    this test's writing (Phase 4 landed on POM only; Phase 6 rolls it out here)."""
+
+    def test_search_by_action_returns_empty_list_not_error(self):
+        self.assertEqual(self.tools.search_by_action("walking"), [])
+
+    def test_get_entity_action_returns_error_dict_not_crash(self):
+        # global_id 7 exists in scene_061 (used elsewhere in this file) but has no action_description.
+        result = self.tools.get_entity_action(7)
+        self.assertIn("error", result)
+        self.assertEqual(result["global_id"], 7)
+
+
+POM_GRAPH_PATH = PROJECT_ROOT / "data" / "POM" / "terrace1" / "event_graph_with_attrs.gpickle"
+
+
+@unittest.skipUnless(POM_GRAPH_PATH.exists(), f"requires the real graph at {POM_GRAPH_PATH}")
+class PomActionToolsTestCase(unittest.TestCase):
+    """POM terrace1's graph has action_description on every entity (Phase 4 ran here first) --
+    exercises search_by_action/get_entity_action against real data, complementing the graceful-
+    degradation checks above."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tools = GraphTools(str(POM_GRAPH_PATH))
+
+    def test_search_by_action_finds_walking_entities(self):
+        results = self.tools.search_by_action("walking")
+        self.assertGreater(len(results), 0)
+        for r in results:
+            self.assertIn("global_id", r)
+            self.assertIn("action_description", r)
+            self.assertIn("similarity", r)
+
+    def test_get_entity_action_matches_search_result(self):
+        results = self.tools.search_by_action("walking", top_k=1)
+        self.assertTrue(results)
+        gid = results[0]["global_id"]
+        detail = self.tools.get_entity_action(gid)
+        self.assertEqual(detail["action_description"], results[0]["action_description"])
+
+    def test_get_entity_action_on_unknown_id_returns_error(self):
+        result = self.tools.get_entity_action(-1)
+        self.assertIn("error", result)
+
+
 if __name__ == "__main__":
     unittest.main()
