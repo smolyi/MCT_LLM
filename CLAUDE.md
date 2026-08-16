@@ -291,6 +291,256 @@ Key confirmed facts about it:
       evidenced "no" answer was graded FAIL because it never used the
       literal word "no" -- an automated-grading strictness artifact,
       not a real model failure.
+- [x] Query interface hardened through many rounds of real-usage
+      debugging (`--debug`'s full token/tool-call trace was essential
+      throughout). Architecture converged on: general, composable tools
+      (not one bespoke tool per query shape) that the LLM orchestrates
+      itself across as many iterations as needed, with every fact-bearing
+      result rendered by a **deterministic Python formatter** and appended
+      to the model's answer verbatim -- never retyped, summarized, or
+      re-derived by the model. This single pattern was the only reliably
+      effective fix across every "the model got a fact wrong" class of bug
+      found this session (see "Insights and lessons learned" below).
+      Major additions: real spatial proximity (`find_nearby_entities`,
+      `find_nearby_entities_by_description`) using per-frame trajectories,
+      not just camera+time co-occurrence; `rank_entities_by_interaction_count`
+      (full-graph aggregation in code, since per-entity LLM looping is both
+      infeasible at ~750 entities and unreliable at counting even smaller
+      lists -- one real miscount: 281 actual vs 200 reported);
+      `count_nearby_entities` (a lightweight, general "how many interactions
+      does X have" primitive); a continuing work-queue for interactor-count
+      coverage (drains a few ids per iteration until every discovered
+      interactor has been asked about, not just a one-shot first batch);
+      `list_low_quality_caption_entities` (see below).
+      Found and fixed a real, reproducible model-reliability ceiling:
+      batches of 6+ simultaneous tool calls in one turn pushed
+      Qwen2.5-7B-Instruct's greedy decoding into generating garbled
+      `<tool_call>` tags (a literal stray token replacing the tag),
+      silently dropping calls -- and the model's next turn sometimes
+      FABRICATED plausible-looking results for exactly the missing ones,
+      format-indistinguishable from genuine tool output. Fixed by capping
+      simultaneous tool-call batches at 3 (empirically reliable all
+      session) plus a structural scrubber
+      (`_strip_fabricated_count_claims`) that cross-checks every count
+      claim in the model's own prose against ids that actually have a real
+      tool result, regardless of whether the fabrication is wrapped in a
+      fake `<tool_response>` tag or just bare prose matching the report
+      template.
+- [x] Caption pipeline quality pass, triggered by a real finding: an entity
+      flagged as "non-human" (captioned "a sandwich with a sandwich on it")
+      turned out on direct visual inspection to be a real person. This
+      recalibrated the whole feature's premise -- most flagged entities are
+      believed to be miscaptioned PEOPLE, not genuine non-human objects
+      (the person detector fires on the person class, so a false positive
+      is far more likely to be a badly-captured real person than an actual
+      non-human object appearing in this scene). Renamed
+      `list_non_human_entities` -> `list_low_quality_caption_entities`
+      throughout, with honest framing in every description/report string.
+      Root-caused and fixed two real captioning-pipeline bugs in
+      `extract_entity_attributes.py`'s medoid consensus selection:
+      degenerate BLIP captions (decoder repetition loops, e.g. "a bald
+      bald bald bald...") were eligible to be chosen as consensus over
+      coherent, correct captions; and even non-degenerate but WRONG
+      captions could still win via pure embedding-distance-to-mean over a
+      majority of person-describing captions (the "sandwich" case) -- fixed
+      with a degenerate-caption detector plus a majority-vote tiebreak.
+      Added two more caption-quality signals, both empirically calibrated
+      against the real data rather than guessed: BLIP's own per-token
+      generation confidence (an initial guess of 0.5 was checked against
+      the actual distribution of 2063 sampled captions -- mean 0.412,
+      median 0.409, p90 0.508 -- and found to exclude 88% of ALL captions;
+      recalibrated to ~p10, 0.3), and frame-margin exclusion for likely
+      cut-off crops (a hard-exclusion first version left 352 of 749
+      entities with ZERO extractable crops at all when their whole
+      trajectory ran along a frame edge -- fixed to a soft preference with
+      fallback). Net effect: 58 -> 30 flagged entities.
+- [x] Regression test suite added (`tests/`) -- see "Tests" below.
+
+## Insights and lessons learned
+
+- **Prompt-only fixes are unreliable; code-level/deterministic fixes are
+  reliable.** Demonstrated concretely 6+ times: caption hallucination
+  mitigation, single-candidate checking, fact corruption/caption bleeding,
+  fabrication under compound queries, narration-without-action, and a
+  "don't retype a long list" instruction that needed to be repeated INSIDE
+  the tool's own report text, right next to the data, before it reliably
+  worked -- a system-prompt-only version did not. The one consistent
+  exception: nudges that are deterministic, code-generated, and placed
+  immediately before the model's next turn (not just anywhere in the
+  system prompt) DO work reliably -- recency/proximity in the context
+  window matters more than where a rule is stated.
+- **Greedy decoding is a double-edged choice.** Chosen for reproducibility
+  (essential for this whole session's debugging methodology -- re-running
+  an identical query after ONE code change and attributing any behavior
+  difference to that change), but it's also more prone to
+  repetition-induced degeneration than sampling, which is exactly what
+  caused the tool-call-tag garbling under long, repetitive multi-call
+  batches. The fix that held was capping batch size to the empirically
+  reliable ceiling, not switching decoding strategy.
+- **A 7B model's tool-calling has a real, measurable reliability ceiling**
+  for this kind of agentic workload -- reliable at ~3 simultaneous tool
+  calls per turn, degenerating and occasionally fabricating past ~6. A
+  genuine capability limit, not a prompting problem; worth testing directly
+  whether a larger or more heavily agentic-tool-use-trained model needs
+  any of the batch-size/fabrication-scrubbing machinery built this session
+  to work around it (see "Alternative models" below), rather than
+  assuming either way.
+- **Uncertainty should be surfaced as structured data, not just prose.**
+  `caption_agreement`, `low_confidence` proximity flags,
+  `MIN_RELIABLE_DETECTIONS`, `DUPLICATE_DETECTION_DISTANCE_M`, and now
+  BLIP's own per-token confidence all follow the same pattern: expose
+  uncertainty as its own field instead of hiding it inside a single point
+  estimate, so downstream consumers (the LLM, or a human reading the
+  report) can weight it appropriately.
+- **Calibrate thresholds against the actual data distribution, not
+  intuition.** Two guessed thresholds this session (BLIP confidence 0.5,
+  and an implicit assumption that hard-excluding margin crops would be
+  safe) both turned out to be substantially wrong when checked against
+  real numbers (88% exclusion; 352/749 entities losing their caption
+  entirely). Both were caught before shipping specifically because the
+  project's convention is to verify empirically rather than trust a
+  first-pass choice.
+- **A tool's apparent finding is only as trustworthy as its naming and
+  framing.** `list_non_human_entities` wasn't wrong in what it computed
+  (absence of human words in a caption) -- it was wrong in what it CLAIMED
+  that meant. Renaming it and rewriting every description honestly (once
+  direct visual evidence contradicted the original premise) mattered as
+  much as any code fix.
+- **RAG vs. this project's actual architecture**: only `search_by_appearance`
+  is real RAG (embedding retrieval for a worded description -> candidate
+  global_ids); everything else is deterministic graph traversal/aggregation
+  over the NetworkX event graph. This matches the project's founding
+  thesis (flat RAG alone can't handle compositional/temporal/cross-camera-
+  identity queries) concretely, not just in principle.
+- **MCP (Model Context Protocol) was discussed but not implemented.** The
+  current tool-calling loop is a bespoke, in-process script (Qwen's native
+  chat-template tool-call convention + a manual Python dispatch loop), not
+  an MCP server/client. Wrapping `graph_tools.py`'s functions behind a real
+  MCP server would make them reusable by any MCP-compatible agent, not
+  just this one script's hard-wired 7B model -- a real, available option
+  if broader tool reuse becomes a goal, and an interesting testbed for
+  whether a more capable model actually needs the scaffolding built here
+  specifically to work around Qwen2.5-7B's limits.
+
+## Known limitations and future work
+
+- **Scope is people-only by construction, not by accident.** The detector
+  requests 5 COCO classes (`person, car, motorcycle, bus, truck`), and
+  `build_pred_file.py` explicitly filters to `class == "person"` before
+  the event graph is even built (this dataset's official eval is
+  "Multi-Camera PEOPLE Tracking"). Static scene objects (e.g. warehouse
+  boxes on a shelf, clearly visible in some frames) are never eligible to
+  become a graph entity at any pipeline stage -- confirmed directly when
+  asked why visible shelf boxes were never reported by any tool. A scope
+  boundary, not a detection gap.
+- **General movable-object tracking** (boxes, purses, backpacks, "anything
+  that can move") is a stated future goal, not yet started. COCO already
+  has `backpack`/`handbag`/`suitcase` classes the current YOLO checkpoint
+  could detect cheaply by extending `CLASSES_OF_INTEREST` -- but "anything
+  that can move" is inherently open-vocabulary, which no fixed class list
+  covers; needs an open-vocabulary detector instead (see "Alternative
+  models" below).
+- **Specific action/event recognition** (a man turned on a light, pressed a
+  button, entered an elevator) is a stated future goal and a genuinely
+  different KIND of problem from everything built so far. BLIP captions
+  one static crop; YOLO detects one static frame; the event graph tracks
+  POSITION over time. None of that can see a state change or a brief
+  interaction. Needs either a real temporal/video-action-recognition
+  model, or a VLM prompted over short clips/frame sequences -- a new
+  pipeline stage, not an extension of BLIP captioning.
+- **Within-camera track fragmentation is still the dominant identity-count
+  error**, confirmed quantitatively: 20 true identities vs. 809 predicted,
+  with within-camera fragmentation (not cross-camera matching) as the
+  measured dominant cause. Properly fixing this needs appearance-based
+  association during single-camera tracking (e.g. BoT-SORT+ReID), not a
+  parameter tweak (a `track_buffer` increase was tried and didn't help,
+  confirming the cause is per-frame ID-swap ambiguity, not track loss over
+  time) -- deferred, not fixed.
+- **OSNet's domain gap on this synthetic dataset is real and unaddressed**:
+  same-camera-different-track cosine similarity (a clean "different real
+  person" baseline) averaged ~0.70 with max up to 0.96 -- weak
+  discrimination, since the checkpoint was fine-tuned on real photos
+  (Market-1501), not synthetic renders. Would need domain adaptation or a
+  different backbone to close.
+- **Grounding/consistency gaps in the LLM's own free text remain possible**
+  even after all the deterministic-report machinery -- e.g. the model's
+  short framing sentence has been observed to misattribute a fact to the
+  wrong entity, while the guaranteed-correct report right below it stays
+  accurate. The deterministic-report pattern makes this cosmetic rather
+  than fact-threatening, but hasn't eliminated it at the source.
+- **The captioning pipeline's remaining failure mode**: coherent-but-wrong
+  captions where NONE of the 3 sampled crops mention a person -- majority
+  vote can't fix a unanimous wrong answer. No current signal catches this
+  class; would need more crops per entity, a differently-hallucination-
+  prone captioner, or cross-referencing the detector's own class
+  confidence.
+
+## Alternative models to consider
+
+Not implemented -- options identified for when/if revisiting each stage.
+
+- **Detection, for open-vocabulary/movable-object tracking**: SAM3
+  (promptable segmentation with text/visual prompts, could name arbitrary
+  objects like "box" or "purse" that aren't COCO classes), Grounding DINO
+  or OWL-ViT (open-vocabulary detection via text prompts), or YOLO-World
+  (open-vocabulary YOLO variant, closer to a drop-in replacement for the
+  current `ultralytics` detector). These trade detection speed for
+  vocabulary flexibility -- worth benchmarking against this project's
+  real-time-per-camera budget before committing.
+- **Captioning, as a BLIP replacement**: BLIP-2 or InstructBLIP (stronger
+  language grounding, still efficient), Florence-2 (Microsoft, strong at
+  short factual captions, small), or a small Qwen-VL/Qwen2.5-VL variant
+  (multimodal sibling of the LLM already used here, so the project would
+  only depend on one model family for both captioning and query reasoning
+  -- worth checking whether its hallucination profile is actually better
+  than BLIP's documented "sandwich"/repetition failures before switching,
+  not assuming it).
+- **Video-level captioning/action recognition**: Qwen2-VL / Qwen2.5-VL can
+  take multiple frames or short clips directly (unlike BLIP, one static
+  image at a time) -- a natural first thing to try for "did this entity
+  perform action X" queries, since it wouldn't require a wholly new model
+  family. VideoMAE or SlowFast are purpose-built temporal-action models if
+  a dedicated (non-VLM) action-recognition stage is preferred instead.
+- **Query-interface LLM**: a larger Qwen2.5 variant (14B/32B) or a model
+  more heavily trained for agentic tool-use specifically. Directly
+  motivated by this session's finding that Qwen2.5-7B has a measured
+  ~3-call reliable batch ceiling under greedy decoding -- worth testing
+  whether a bigger/more tool-hardened model removes the need for the
+  batch-cap/fabrication-scrubber scaffolding built to work around it,
+  rather than assuming it would.
+- **ReID, for the confirmed domain gap**: a checkpoint fine-tuned on
+  synthetic/rendered pedestrian data (if one exists) instead of
+  Market-1501 (real photos), or domain adaptation on top of the current
+  OSNet checkpoint using this dataset's own synthetic crops.
+
+## Tests
+
+`tests/` (stdlib `unittest`, no new dependency -- consistent with keeping
+`mct-env` slim). Three files, split by cost/dependency:
+
+- `tests/test_regressions.py` -- fast (<1s), pure Python logic, no GPU/
+  model/graph file needed. One test class per bug found this session
+  (degenerate captions, human-word heuristic gaps, agreement-score
+  display, fabrication scrubbing, report-merging, display-report
+  assembly, invented-id recovery, the interactor-count nudge, narration-
+  without-action, tool-call parsing, BLIP-confidence calibration). Run
+  this one on every change.
+- `tests/test_graph_integration.py` -- loads the real
+  `event_graph_with_attrs.gpickle` (seconds to ~3 minutes -- one test does
+  a real full-graph scan). Verifies the fixes hold against actual data:
+  entity 8 is no longer captioned "sandwich", `find_nearby_entities`
+  isn't silently truncated at 10, no flagged entity has a degenerate
+  caption or a too-short track, proximity match-type categorization is
+  internally consistent, ranking isn't capped at 10.
+- `tests/test_llm_smoke.py` -- SLOW, GPU-dependent, skipped unless
+  `RUN_LLM_TESTS=1` is set (loads Qwen2.5-7B-Instruct and runs real
+  generation; each query can take minutes). Covers the two bugs that are
+  fundamentally about model behavior, not deterministic code: the
+  batch-size/fabrication saga, and invented-id recovery in a live run.
+
+Run everything fast: `python tests/test_regressions.py -v`
+Run graph integration: `python tests/test_graph_integration.py -v`
+Run LLM smoke tests: `RUN_LLM_TESTS=1 python tests/test_llm_smoke.py -v`
 
 ## Final pipeline summary (scene_061, cameras 0535-0538)
 

@@ -660,6 +660,36 @@ def _mentions_unexecuted_tool(text: str, tool_names) -> str:
     return None
 
 
+def format_invented_id_recovery(invented_id_errors: list, known_entity_ids: set) -> str:
+    """Recovery message for a real observed failure: the model bundled a ranking/search call together
+    with follow-up detail calls in the same turn, invented placeholder ids (e.g. 12345) for the latter
+    since it couldn't have known the real ones yet, got real "no entity" errors back, and then gave up
+    ("not enough evidence") despite the REAL result being right there in the same batch. Names the real
+    ids explicitly instead of leaving the model to notice them on its own -- a system-prompt-only
+    version of this instruction did not reliably prevent the invented ids in the first place, but this
+    structural nudge (fired only once an invented id actually errors out) reliably self-corrects it."""
+    bad = ", ".join(str(g) for g in invented_id_errors)
+    good = ", ".join(str(g) for g in sorted(known_entity_ids))
+    return (f"\nglobal_id(s) {bad} do not exist in this dataset -- do not reuse or guess ids "
+            f"like these. The REAL entity ids confirmed by your own tool results so far are: "
+            f"{good}. Use ONLY these real ids for any further detail calls this query needs.")
+
+
+def _build_display_reports(proximity_calls: dict, rank_report_texts: list, other_report_texts: list,
+                            count_results: dict) -> list:
+    """Assembles the final list of report blocks shown to the user, from the structured state
+    answer_query accumulates during the tool-call loop. Pulled out to a standalone function (rather
+    than staying a closure inside answer_query) specifically so it's unit-testable without needing a
+    live model -- this is exactly where a real bug lived: an earlier version only reconstructed the
+    rank/proximity categories, so any OTHER deterministic-report tool's output (e.g.
+    list_low_quality_caption_entities) silently never reached the final answer at all."""
+    summary = format_deterministic_summary(proximity_calls)
+    return ([summary] if summary else []) + rank_report_texts + other_report_texts + [
+        f"{header}\n{format_proximity_report_merged(result, count_results)}"
+        for header, result in proximity_calls.values()
+    ]
+
+
 def answer_query(tokenizer, model, tool_fns, query: str, max_iters: int, verbose: bool,
                   debug: bool = False, debug_dir: Path = None) -> str:
     messages = [
@@ -699,12 +729,7 @@ def answer_query(tokenizer, model, tool_fns, query: str, max_iters: int, verbose
     # enough evidence") instead of noticing the REAL result was sitting right there in the same batch.
 
     def build_display_reports() -> list:
-        summary = format_deterministic_summary(proximity_calls)
-        reports = ([summary] if summary else []) + rank_report_texts + other_report_texts + [
-            f"{header}\n{format_proximity_report_merged(result, count_results)}"
-            for header, result in proximity_calls.values()
-        ]
-        return reports
+        return _build_display_reports(proximity_calls, rank_report_texts, other_report_texts, count_results)
 
     def finish(answer: str, source: str) -> str:
         if trace is not None:
@@ -873,16 +898,7 @@ def answer_query(tokenizer, model, tool_fns, query: str, max_iters: int, verbose
                 print(f"\n--- interactor-count nudge ({len(pending_count_ids)} left after this batch) ---\n{nudge}\n")
             messages.append({"role": "user", "content": nudge})
         if invented_id_errors and known_entity_ids:
-            # Recovery for a real observed failure: the model bundled a ranking/search call together
-            # with follow-up detail calls in the same turn, invented placeholder ids (e.g. 12345) for
-            # the latter since it couldn't have known the real ones yet, got real "no entity" errors
-            # back, and then gave up ("not enough evidence") despite the REAL result being right there
-            # in the same batch. Point it at the real ids explicitly instead of leaving it to notice.
-            bad = ", ".join(str(g) for g in invented_id_errors)
-            good = ", ".join(str(g) for g in sorted(known_entity_ids))
-            recovery = (f"\nglobal_id(s) {bad} do not exist in this dataset -- do not reuse or guess ids "
-                        f"like these. The REAL entity ids confirmed by your own tool results so far are: "
-                        f"{good}. Use ONLY these real ids for any further detail calls this query needs.")
+            recovery = format_invented_id_recovery(invented_id_errors, known_entity_ids)
             if verbose:
                 print(f"\n--- invented-id recovery nudge ---\n{recovery}\n")
             messages.append({"role": "user", "content": recovery})
