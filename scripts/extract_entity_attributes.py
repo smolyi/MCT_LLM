@@ -150,13 +150,24 @@ def main():
         for frame, cam in pick_sample_frames(all_frames, args.crops_per_entity):
             sample_targets_by_camera[cam].append((gid, frame))
 
-    # Extract crops, grouped by camera so each video is opened/seeked once.
+    # Extract crops, grouped by camera so each video is opened/read once. Split into two phases:
+    # first resolve every target's exact bbox (pure dict lookups against by_cam_frame, no video I/O),
+    # THEN read the video in ONE SEQUENTIAL pass collecting every needed frame as it's encountered --
+    # never cap.set()-seeking per target. This matters a lot more than it sounds: measured directly on
+    # an old (2008, IV50-codec) AVI source, a single cap.set() random seek took ~0.83s, vs ~0.0016s for
+    # a sequential read -- ~500x slower, which at ~3 crops x hundreds of entities turned a
+    # multi-second job into a multi-hour one. Modern H.264/MP4 sources (e.g. scene_061) seek fast
+    # enough that this wasn't previously noticeable, but sequential reading is strictly no worse for
+    # them either, so this applies uniformly rather than being source-specific.
     crops_by_gid = defaultdict(list)  # gid -> [np.ndarray, ...]
     for cam, targets in sample_targets_by_camera.items():
         cam_dir = f"camera_{int(cam):04d}"
         cap = cv2.VideoCapture(str(scene_dir / cam_dir / "video.mp4"))
         frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # Phase 1: resolve each (gid, frame) target to an exact (frame, bbox) -- no video I/O yet.
+        resolved = {}  # gid -> (fr, l, t, w, h)
         for gid, frame in targets:
             # Two passes: prefer a non-margin bbox within the search window, but fall back to a
             # margin-touching one rather than yielding nothing at all -- a first version of this made
@@ -185,18 +196,28 @@ def main():
                 if bbox:
                     break
             bbox = bbox or fallback_bbox
-            if bbox is None:
-                continue
-            fr, l, t, w, h = bbox
-            cap.set(cv2.CAP_PROP_POS_FRAMES, fr)
-            ok, img = cap.read()
-            if not ok:
-                continue
-            h_img, w_img = img.shape[:2]
-            x1, y1 = max(0, int(l)), max(0, int(t))
-            x2, y2 = min(w_img, int(l + w)), min(h_img, int(t + h))
-            if x2 > x1 and y2 > y1:
-                crops_by_gid[gid].append(img[y1:y2, x1:x2, ::-1])  # BGR -> RGB
+            if bbox is not None:
+                resolved[gid] = bbox
+
+        # Phase 2: one sequential pass over the video, grabbing every resolved frame as it comes up.
+        targets_by_frame = defaultdict(list)  # frame -> [(gid, l, t, w, h), ...]
+        for gid, (fr, l, t, w, h) in resolved.items():
+            targets_by_frame[fr].append((gid, l, t, w, h))
+        if targets_by_frame:
+            last_needed_frame = max(targets_by_frame)
+            frame_idx = 0
+            while frame_idx <= last_needed_frame:
+                ok, img = cap.read()
+                if not ok:
+                    break
+                if frame_idx in targets_by_frame:
+                    h_img, w_img = img.shape[:2]
+                    for gid, l, t, w, h in targets_by_frame[frame_idx]:
+                        x1, y1 = max(0, int(l)), max(0, int(t))
+                        x2, y2 = min(w_img, int(l + w)), min(h_img, int(t + h))
+                        if x2 > x1 and y2 > y1:
+                            crops_by_gid[gid].append(img[y1:y2, x1:x2, ::-1])  # BGR -> RGB
+                frame_idx += 1
         cap.release()
 
     n_crops = sum(len(v) for v in crops_by_gid.values())

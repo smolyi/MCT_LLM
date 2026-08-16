@@ -356,6 +356,119 @@ Key confirmed facts about it:
       fallback). Net effect: 58 -> 30 flagged entities.
 - [x] Regression test suite added (`tests/`) -- see "Tests" below.
 
+## Additional data sources: WildTrack, POM, EPFL-RLC
+
+Beyond the primary nvidia/PhysicalAI-SmartSpaces pipeline (scene_061),
+three more EPFL CVLab multi-camera datasets were added, each independent
+(no cross-scene merging -- the graph schema has no notion of "which world
+this happened in," and no query needs cross-scene reasoning). Each keeps
+its own `pred_full.txt`/`event_graph_with_attrs.gpickle`, run with
+`query_interface.py --graph <path>` explicit each time (scene_061's
+default is untouched).
+
+**Ethics, stated plainly and deliberately** (this section exists so the
+decision is visible, not silent, mirroring how the original WildTrack
+rejection above was documented): two of these three sources are the SAME
+category of ethical concern that got WildTrack originally rejected --
+real people, recorded via camera, without documented meaningful informed
+consent. This was raised directly and explicitly in conversation before
+any of the three was touched, not discovered after the fact or glossed
+over.
+
+- **WildTrack** (`data/wildtrack/cam1.mp4`..`cam7.mp4`, 7 cameras,
+  1920x1080 ~60fps ~125,850 frames each, no calibration or ground truth
+  available -- videos only): this is the EXACT dataset rejected earlier in
+  this file (real students, no meaningful informed consent, exposing.ai's
+  DukeMTMC parallel). The user was told this explicitly, in these terms,
+  before proceeding, and chose to use it anyway -- **a deliberate,
+  informed reversal of the earlier decision, not a default or an
+  oversight.** Implementation deferred (Phase 2 of the approved plan,
+  needs its own approval before starting) -- no calibration means no
+  world-coordinate reasoning is possible for this source regardless.
+- **EPFL-RLC** (`data/EPFL-RLC/`: JPEG frame sequences, not video; Tsai
+  calibration XMLs; grid-based ground truth): real people recorded in the
+  EPFL Rolex Learning Center (a semi-public space), with **no consent or
+  ethics statement anywhere on the dataset's page** -- same concern class
+  as WildTrack, independently confirmed by fetching and reading the page
+  directly (not assumed). The user was told this explicitly and chose to
+  proceed anyway, **the same kind of deliberate override as WildTrack,
+  not a default.** Implementation deferred (Phase 3 of the approved plan).
+- **POM terrace1** (`data/POM/terrace1/`: 4 cameras, 360x288, 5010 frames
+  each, from EPFL CVLab's "Multi-Camera Pedestrians" / Probabilistic
+  Occupancy Map dataset): **no override needed here** -- the dataset's own
+  page states "All pedestrians on the sequences are members of our
+  laboratory, so there is no privacy issue," genuine documented consent,
+  a materially different situation from the other two. This is the one
+  fully implemented so far (below).
+
+### POM terrace1 -- implemented end-to-end
+
+New file `scripts/adapt_pom_calibration.py` converts POM's native
+calibration into the existing `calibration.json` shape (confirmed by grep
+that nothing downstream reads anything except its `"homography matrix"`
+field, so `geometry.py`/`build_pred_file.py`/etc. needed zero changes).
+
+**Homography direction -- verified empirically, not assumed, and a real
+mistake caught along the way**: POM ships calibration two ways -- a
+directly-given ground-plane homography (`calibration-terrace.txt`) and an
+independent Tsai camera model (`terrace-tsai.zip`) for the same 4 cameras.
+The Tsai-based cross-derivation (reconstructing `P=K[R|t]`, dropping the Z
+column) was tried first as the primary check, but its best-case residual
+against the given homography was 90-300% across every camera -- far too
+large to trust, most likely from a wrong assumption reconstructing this
+specific toolkit's exact rotation/unit convention, which isn't documented
+anywhere found. Fell back to the plan's secondary method: ran real YOLO
+detections on all 4 cameras, mapped them through both candidate uses of
+the given homography, and checked which one made DIFFERENT cameras'
+detections of the same real people converge on the same world coordinates
+(the same physical terrace, observed from 4 angles, should show exactly
+that under a correct calibration). First attempt at scoring this used
+mean pairwise distance across all points, which gave the WRONG answer --
+it conflates "different real people" (expected to be far apart
+regardless of calibration correctness) with "the same person seen by two
+cameras" (should collapse to ~0 under a correct calibration), and is
+dominated by the former. Fixed by scoring the mean nearest-cross-camera-
+detection distance instead (11.6 for the winning case vs. 58.9 for the
+losing one) -- isolates the actual signal. Verified further downstream:
+per-camera world-coordinate medians cluster tightly together (~160-182,
+~219-232) across all 4 cameras once the correct direction is used.
+
+**A real, unrelated performance bug found and fixed while building
+this**: `extract_entity_attributes.py`'s crop extraction used to
+`cap.set(CAP_PROP_POS_FRAMES, ...)`-seek to each target frame
+individually. Measured directly on POM's video files (encoded with the
+old `IV50` codec, from 2008): a single random seek took ~0.83s vs.
+~0.0016s for a sequential read -- ~500x slower, turning what should have
+been a multi-second job into a multi-hour one (caught mid-run: 25+
+minutes of CPU time with 0% GPU utilization, i.e. still stuck before BLIP
+inference even started). Fixed by restructuring crop extraction into two
+phases per camera: resolve every target's exact frame/bbox first (pure
+dict lookups, no video I/O), then do ONE sequential pass over the video
+grabbing every needed frame as it's encountered. This applies to every
+source, not just POM -- scene_061's already-fast-seeking H.264/MP4 files
+aren't disadvantaged by it either, so it's a strict improvement, not a
+POM-specific special case.
+
+**gt_terrace1.txt -- partially decoded, evaluation deferred**: 5010 rows
+(one per frame, matches the video's real frame count) x 9 tab-separated
+columns, values `-1`/`-2`/occasional positive integers at roughly regular
+spacing. Consistent with "9 person-slots, a positive value is a grid-
+cell/position index" (the Fleuret/POM toolkit's known style), not raw
+world coordinates -- still one indirection away from usable per-frame
+(person, world_x, world_y) tuples. Not fully decoded; quantitative HOTA
+evaluation for this scene is a documented, deliberate scope gap, not a
+silent omission. EPFL-RLC's `mv_examples/*.json` turned out to be a
+single-frame(ish) positive/negative ROI-classifier training set (the
+original POM detector's own training data), not a trajectory ground
+truth at all -- evaluation there isn't just deferred, it's **not planned**,
+since the resource isn't shaped for it regardless of decoding effort.
+
+Result: 934 entities, 4 cameras, 129 identities spanning >1 camera (out
+of 1163 raw per-camera tracks -- the same within-camera-fragmentation-
+dominant pattern already documented for scene_061). Manually verified via
+`query_interface.py --graph data/POM/terrace1/event_graph_with_attrs.gpickle`:
+multi-camera entity counts and per-entity camera lists come back sane.
+
 ## Insights and lessons learned
 
 - **Prompt-only fixes are unreliable; code-level/deterministic fixes are
