@@ -339,25 +339,41 @@ class GraphTools:
         across all sightings) are excluded entirely -- a near-instantaneous, blurry detection is more
         likely pure tracking noise than a meaningful flagged entity, and a caption based on it (however
         it reads) isn't worth reporting either way."""
+        return self._entities_by_caption_humanness(want_human=False)
+
+    def list_human_captioned_entities(self) -> list:
+        """The complement of list_low_quality_caption_entities: entities whose caption DOES contain a
+        human-referring word -- i.e. "list all the people" style queries. Added after a real observed
+        failure: asked to "list all people and what they wear," the model called
+        list_low_quality_caption_entities instead (the tool that lists entities whose caption FAILED
+        to mention a person -- the opposite of what was asked), apparently because it was the only tool
+        whose description mentioned people/humans at all. This tool exists specifically so there's an
+        unambiguous, correctly-named, general primitive for the actually-common "list the people" case,
+        rather than leaving the model to force-fit the nearest-sounding tool it has."""
+        return self._entities_by_caption_humanness(want_human=True)
+
+    def _entities_by_caption_humanness(self, want_human: bool) -> list:
         results = []
         for gid, data in self.entities.items():
             caption = (data.get("appearance_caption") or "").lower()
             words = set(caption.replace(",", " ").replace(".", " ").split())
-            if not words & self.HUMAN_CAPTION_WORDS:
-                sightings = sorted(self._sightings_of(gid), key=lambda d: d["start_frame"])
-                total_detections = sum(s.get("num_detections", 0) for s in sightings)
-                if total_detections < MIN_RELIABLE_DETECTIONS:
-                    continue
-                results.append({
-                    "global_id": gid,
-                    "appearance_caption": data.get("appearance_caption"),
-                    "caption_agreement": data.get("caption_agreement"),
-                    "sightings": [
-                        {"camera": s["camera"], "time": format_mmss(s["start_time_sec"])}
-                        for s in sightings
-                    ],
-                    "num_cameras": len({s["camera"] for s in sightings}),
-                })
+            is_human = bool(words & self.HUMAN_CAPTION_WORDS)
+            if is_human != want_human:
+                continue
+            sightings = sorted(self._sightings_of(gid), key=lambda d: d["start_frame"])
+            total_detections = sum(s.get("num_detections", 0) for s in sightings)
+            if total_detections < MIN_RELIABLE_DETECTIONS:
+                continue
+            results.append({
+                "global_id": gid,
+                "appearance_caption": data.get("appearance_caption"),
+                "caption_agreement": data.get("caption_agreement"),
+                "sightings": [
+                    {"camera": s["camera"], "time": format_mmss(s["start_time_sec"])}
+                    for s in sightings
+                ],
+                "num_cameras": len({s["camera"] for s in sightings}),
+            })
         return results
 
     def rank_entities_by_interaction_count(self, max_distance_m: float = 2.0, max_gap_sec: float = 1.0,

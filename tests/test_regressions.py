@@ -238,17 +238,27 @@ class TestDisplayReportAssembly(unittest.TestCase):
     called on its own with no preceding proximity/rank call) silently never
     reached the final answer at all, forcing the model to retype the whole
     thing itself from memory (and get cut off mid-list). Fixed by adding an
-    explicit catch-all category (other_report_texts)."""
+    explicit catch-all category (other_report_texts).
+
+    Second bug, same area: rank_report_texts/other_report_texts were plain
+    lists, so a no-argument tool (e.g. list_low_quality_caption_entities
+    takes none, so every call returns the identical result) called several
+    times in one conversation showed its ~70-entity report duplicated
+    verbatim in the final answer. Fixed by keying both dicts by
+    (name, call_args), same dedup pattern proximity_calls already used."""
 
     def test_other_report_tools_appear_in_final_display(self):
-        other_report_texts = ["--- list_low_quality_caption_entities() ---\n30 entities flagged..."]
-        reports = _build_display_reports(proximity_calls={}, rank_report_texts=[],
+        other_report_texts = {("list_low_quality_caption_entities", ()):
+                               "--- list_low_quality_caption_entities() ---\n30 entities flagged..."}
+        reports = _build_display_reports(proximity_calls={}, rank_report_texts={},
                                           other_report_texts=other_report_texts, count_results={})
-        self.assertIn(other_report_texts[0], reports)
+        self.assertIn(list(other_report_texts.values())[0], reports)
 
     def test_rank_and_proximity_and_other_all_present_together(self):
-        rank_texts = ["--- rank_entities_by_interaction_count() ---\ntop 3..."]
-        other_texts = ["--- list_low_quality_caption_entities() ---\n30 entities..."]
+        rank_texts = {("rank_entities_by_interaction_count", ()):
+                      "--- rank_entities_by_interaction_count() ---\ntop 3..."}
+        other_texts = {("list_low_quality_caption_entities", ()):
+                       "--- list_low_quality_caption_entities() ---\n30 entities..."}
         proximity_calls = {("find_nearby_entities", 7): (
             "--- find_nearby_entities(global_id=7) ---",
             {"target_global_id": 7, "confirmed_proximity_matches": []},
@@ -258,6 +268,20 @@ class TestDisplayReportAssembly(unittest.TestCase):
         self.assertIn("rank_entities_by_interaction_count", joined)
         self.assertIn("list_low_quality_caption_entities", joined)
         self.assertIn("find_nearby_entities", joined)
+
+    def test_repeated_identical_call_does_not_duplicate_in_final_display(self):
+        # The actual observed bug: the same no-argument tool called 3 times produced 3 copies of
+        # its report. Simulates that by writing to the SAME key twice, as answer_query's loop does
+        # for repeated identical calls -- the dict naturally collapses it to one entry.
+        key = ("list_low_quality_caption_entities", ())
+        other_report_texts = {}
+        report_text = "--- list_low_quality_caption_entities() ---\n71 entities flagged..."
+        other_report_texts[key] = report_text
+        other_report_texts[key] = report_text  # second identical call, same key
+        other_report_texts[key] = report_text  # third identical call, same key
+        reports = _build_display_reports(proximity_calls={}, rank_report_texts={},
+                                          other_report_texts=other_report_texts, count_results={})
+        self.assertEqual(reports.count(report_text), 1)
 
 
 class TestInventedIdRecovery(unittest.TestCase):

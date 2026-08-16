@@ -211,19 +211,37 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "list_low_quality_caption_entities",
-            "description": "List entities whose appearance_caption contains no human-referring word -- i.e. the "
-                            "caption FAILED to describe them as a person, for whatever reason. IMPORTANT: this is "
-                            "NOT a non-human object detector, despite what it might sound like -- direct manual "
-                            "verification found that entities flagged this way are usually still real people "
-                            "whose caption failed badly (blur, occlusion, a degenerate/repeated-word BLIP output), "
-                            "not genuine non-human detections. Use this for questions about caption quality/"
-                            "reliability, or 'which entities have failed/unusable captions' -- do NOT present "
-                            "results as 'these are non-human objects' or 'these aren't people'; present them as "
-                            "'these entities have a caption that failed to identify them as a person (most are "
-                            "probably still people)'. Already includes EVERY sighting (camera + time), not just "
-                            "the first -- do NOT call get_entity_timeline per entity for that. Entities with a "
-                            "very short total track are excluded already (too little evidence to be worth "
-                            "reporting either way).",
+            "description": "List entities whose appearance_caption contains NO human-referring word -- i.e. the "
+                            "caption FAILED to describe them as a person, for whatever reason. Use this ONLY for "
+                            "questions about caption quality/reliability, e.g. 'which entities have a failed/"
+                            "unusable caption' -- for 'list all the people' or 'what is everyone wearing' style "
+                            "questions, use list_human_captioned_entities instead (the opposite filter) -- do NOT "
+                            "use this one for those, its result is exactly the entities that are NOT usefully "
+                            "described as people. IMPORTANT: this is NOT a non-human object detector, despite what "
+                            "it might sound like -- direct manual verification found that entities flagged this "
+                            "way are usually still real people whose caption failed badly (blur, occlusion, a "
+                            "degenerate/repeated-word BLIP output), not genuine non-human detections. Do not "
+                            "present results as 'these are non-human objects' or 'these aren't people'; present "
+                            "them as 'these entities have a caption that failed to identify them as a person "
+                            "(most are probably still people)'. Already includes EVERY sighting (camera + time), "
+                            "not just the first -- do NOT call get_entity_timeline per entity for that. Entities "
+                            "with a very short total track are excluded already.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_human_captioned_entities",
+            "description": "List entities whose appearance_caption DOES contain a human-referring word -- i.e. "
+                            "the general-purpose tool for 'list all the people', 'who is in this scene', 'what "
+                            "is everyone wearing' style questions. Returns global_id, caption, caption_agreement, "
+                            "and EVERY sighting (camera + time) per entity -- do NOT call get_entity_timeline per "
+                            "entity for that, and do NOT retype/re-describe individual entries yourself, the "
+                            "report is appended automatically. For the OPPOSITE filter (entities whose caption "
+                            "failed to mention a person), use list_low_quality_caption_entities instead. Entities "
+                            "with a very short total track are excluded already (too little evidence to be worth "
+                            "reporting either way). This can be a LONG list on a busy scene -- that's expected.",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -378,6 +396,7 @@ DETERMINISTIC_REPORT_FORMATTERS = {
     "rank_entities_by_interaction_count": lambda result: format_ranking_report(result),
     "count_nearby_entities": lambda result: format_count_report(result),
     "list_low_quality_caption_entities": lambda result: format_low_quality_caption_report(result),
+    "list_human_captioned_entities": lambda result: format_human_captioned_report(result),
 }
 DETERMINISTIC_REPORT_TOOLS = set(DETERMINISTIC_REPORT_FORMATTERS)
 
@@ -438,6 +457,36 @@ def format_low_quality_caption_report(result: list) -> str:
         lines.append(f"\nDo NOT retype, re-list, or summarize these {len(result)} entries in your final "
                       f"answer -- this exact list is appended automatically. Write only a short framing "
                       f"sentence (e.g. how many were found and the general pattern), nothing more.")
+    return "\n".join(lines)
+
+
+def format_human_captioned_report(result: list) -> str:
+    """Deterministically render a list_human_captioned_entities result -- the complement of
+    list_low_quality_caption_entities, added after a real observed failure: asked to "list all people
+    and what they wear," the model called list_low_quality_caption_entities (the tool for entities
+    whose caption FAILED to mention a person -- the opposite of what was asked), then -- lacking any
+    tool that actually did what was asked -- free-text-synthesized the whole list itself from memory
+    and got cut off mid-list by its own output length limit. Routed through a deterministic formatter
+    for the same reason as every list-returning tool here: retyping a long list from the model's own
+    context is exactly the failure mode that produced the wrong/truncated answer in the first place."""
+    if not result:
+        return "No human-captioned entities found."
+    lines = [f"{len(result)} entities whose caption identifies them as a person:"]
+    for r in result:
+        agreement = r.get("caption_agreement")
+        agreement_str = f"agreement={agreement}" if agreement is not None else "agreement unknown"
+        sightings = r.get("sightings", [])
+        sighting_str = "; ".join(f"camera {s['camera']} at {s['time']}" for s in sightings)
+        cams = f"{r.get('num_cameras', len({s['camera'] for s in sightings}))} camera(s) total"
+        lines.append(f"  - global_id {r['global_id']}: {r['appearance_caption']} [{agreement_str}], "
+                      f"seen: {sighting_str} ({cams})")
+    if len(result) > 10:
+        # Same pattern proven necessary for format_low_quality_caption_report and format_ranking_report
+        # -- a system-prompt-only version of this instruction did not reliably stop the model retyping
+        # a long list itself; repeating it here, right next to the data, is what actually worked.
+        lines.append(f"\nDo NOT retype, re-list, or summarize these {len(result)} entries in your final "
+                      f"answer -- this exact list is appended automatically. Write only a short framing "
+                      f"sentence (e.g. how many were found), nothing more.")
     return "\n".join(lines)
 
 
@@ -675,16 +724,22 @@ def format_invented_id_recovery(invented_id_errors: list, known_entity_ids: set)
             f"{good}. Use ONLY these real ids for any further detail calls this query needs.")
 
 
-def _build_display_reports(proximity_calls: dict, rank_report_texts: list, other_report_texts: list,
+def _build_display_reports(proximity_calls: dict, rank_report_texts: dict, other_report_texts: dict,
                             count_results: dict) -> list:
     """Assembles the final list of report blocks shown to the user, from the structured state
     answer_query accumulates during the tool-call loop. Pulled out to a standalone function (rather
     than staying a closure inside answer_query) specifically so it's unit-testable without needing a
     live model -- this is exactly where a real bug lived: an earlier version only reconstructed the
     rank/proximity categories, so any OTHER deterministic-report tool's output (e.g.
-    list_low_quality_caption_entities) silently never reached the final answer at all."""
+    list_low_quality_caption_entities) silently never reached the final answer at all.
+    rank_report_texts/other_report_texts are dicts keyed by (name, call_args), not plain lists --
+    another real, observed bug: a tool with no arguments (e.g. list_low_quality_caption_entities takes
+    none) produces the EXACT same result every time it's called, and the model sometimes calls it
+    several times in one conversation; a plain list appended every call showed the same ~70-entity
+    report 3 times over in the final answer. Keying by call dedupes automatically, same pattern as
+    proximity_calls already uses."""
     summary = format_deterministic_summary(proximity_calls)
-    return ([summary] if summary else []) + rank_report_texts + other_report_texts + [
+    return ([summary] if summary else []) + list(rank_report_texts.values()) + list(other_report_texts.values()) + [
         f"{header}\n{format_proximity_report_merged(result, count_results)}"
         for header, result in proximity_calls.values()
     ]
@@ -714,12 +769,15 @@ def answer_query(tokenizer, model, tool_fns, query: str, max_iters: int, verbose
     # count_nearby_entities(...) block the reader has to cross-reference by id (see
     # format_proximity_report_merged). Keyed to dedupe repeated identical calls automatically.
     proximity_calls = {}  # (name, gid-or-description) -> (header, result)
-    rank_report_texts = []  # formatted rank_entities_by_interaction_count reports, in call order
+    rank_report_texts = {}  # (name, call_args) -> formatted rank_entities_by_interaction_count report
     count_results = {}  # global_id -> count_nearby_entities result
-    other_report_texts = []  # any OTHER deterministic-report tool's output, in call order -- a real
-    # bug lived here: build_display_reports originally only reconstructed the rank/proximity
-    # categories, so any tool outside those two (e.g. list_low_quality_caption_entities) silently never made it
-    # into the final answer at all, forcing the model to retype the whole thing itself from memory.
+    other_report_texts = {}  # (name, call_args) -> any OTHER deterministic-report tool's output -- a
+    # real bug lived here: build_display_reports originally only reconstructed the rank/proximity
+    # categories, so any tool outside those two (e.g. list_low_quality_caption_entities) silently never
+    # made it into the final answer at all, forcing the model to retype the whole thing itself from
+    # memory. A second real bug: this was a plain list, so a no-argument tool called several times
+    # (identical result every time) showed up duplicated in the final answer -- now keyed like
+    # proximity_calls to dedupe automatically.
 
     known_entity_ids = set()  # every global_id CONFIRMED to exist via a real tool result so far --
     # used to recover from a real observed failure: the model sometimes bundles a ranking/search call
@@ -874,7 +932,8 @@ def answer_query(tokenizer, model, tool_fns, query: str, max_iters: int, verbose
                     dedup_key = call_args.get("global_id", call_args.get("description"))
                     proximity_calls[(name, dedup_key)] = (header, result)
                 elif name == "rank_entities_by_interaction_count":
-                    rank_report_texts.append(f"{header}\n{report}")
+                    rank_key = (name, tuple(sorted(call_args.items())))
+                    rank_report_texts[rank_key] = f"{header}\n{report}"
                 elif name == "count_nearby_entities" and "global_id" in result:
                     count_results[result["global_id"]] = result
                     seen_interactor_ids.add(result["global_id"])
@@ -884,7 +943,8 @@ def answer_query(tokenizer, model, tool_fns, query: str, max_iters: int, verbose
                     # Any deterministic-report tool not covered by the specific categories above (e.g.
                     # list_low_quality_caption_entities) -- without this, its report silently never reached the
                     # final answer at all (see other_report_texts' declaration for the real bug this fixes).
-                    other_report_texts.append(f"{header}\n{report}")
+                    other_key = (name, tuple(sorted(call_args.items())))
+                    other_report_texts[other_key] = f"{header}\n{report}"
                 deterministic_reports.append(f"{header}\n{report}")
                 if verbose:
                     print(f"\n--- deterministic report (fact-guaranteed, not LLM-generated) ---\n{report}\n")
@@ -967,6 +1027,7 @@ def main():
         "find_nearby_entities_by_description": tools.find_nearby_entities_by_description,
         "list_multi_camera_entities": tools.list_multi_camera_entities,
         "list_low_quality_caption_entities": tools.list_low_quality_caption_entities,
+        "list_human_captioned_entities": tools.list_human_captioned_entities,
         "rank_entities_by_interaction_count": tools.rank_entities_by_interaction_count,
     }
 
